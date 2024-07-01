@@ -1,6 +1,6 @@
-collectionName: prefect-docker
+integrationName: prefect-docker
 author: Prefect
 authorUrl: https://prefect.io
-documentation: https://prefecthq.github.io/prefect-docker/
-iconUrl: /img/collections/docker.png
+documentation: prefect-docker
+iconUrl: /images/integrations/docker.png
 tag: Docker

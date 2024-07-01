@@ -1,4 +1,3 @@
-import json
 import textwrap
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
@@ -7,26 +6,19 @@ from uuid import UUID, uuid4
 
 import httpx
 import pendulum
+import pydantic
 import pytest
 import sqlalchemy as sa
+from fastapi.applications import FastAPI
 from httpx import ASGITransport, AsyncClient
 from pendulum.datetime import DateTime
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from prefect._internal.pydantic import HAS_PYDANTIC_V2
-
-if HAS_PYDANTIC_V2:
-    import pydantic.v1 as pydantic
-else:
-    import pydantic
-
-from prefect._vendor.fastapi.applications import FastAPI
-
 from prefect.server import models as server_models
 from prefect.server import schemas as server_schemas
-from prefect.server.api.automations import FlowRunInfrastructureMissing
+from prefect.server.api.validation import ValidationError
 from prefect.server.database.interface import PrefectDBInterface
-from prefect.server.events import actions
+from prefect.server.events import actions, filters
 from prefect.server.events.models.automations import (
     create_automation,
     read_automations_related_to_resource,
@@ -46,15 +38,17 @@ from prefect.server.events.schemas.automations import (
 from prefect.server.models import deployments
 from prefect.settings import (
     PREFECT_API_SERVICES_TRIGGERS_ENABLED,
-    PREFECT_EXPERIMENTAL_EVENTS,
     temporary_settings,
 )
+from prefect.utilities.pydantic import parse_obj_as
 
 
 @pytest.fixture(autouse=True)
 def enable_automations():
     with temporary_settings(
-        {PREFECT_EXPERIMENTAL_EVENTS: True, PREFECT_API_SERVICES_TRIGGERS_ENABLED: True}
+        {
+            PREFECT_API_SERVICES_TRIGGERS_ENABLED: True,
+        }
     ):
         yield
 
@@ -110,8 +104,8 @@ async def create_work_pool(
 ):
     work_pool = await server_models.workers.create_work_pool(
         session=session,
-        work_pool=server_schemas.actions.WorkPoolCreate.construct(
-            _fields_set=server_schemas.actions.WorkPoolCreate.__fields_set__,
+        work_pool=server_schemas.actions.WorkPoolCreate.model_construct(
+            _fields_set=server_schemas.actions.WorkPoolCreate.model_fields_set,
             name="wp-1",
             type=type,
             description="None",
@@ -134,7 +128,6 @@ async def create_deployment(session, work_pool, job_vars: dict) -> UUID:
             flow_id=flow.id,
             paused=False,
             work_queue_id=work_pool.default_queue_id,
-            infra_overrides=job_vars,
         ),
     )
     return deployment.id
@@ -164,48 +157,24 @@ async def create_run_deployment_automation_payload(deployment_id: UUID, job_vars
 async def create_objects_for_automation(
     session: AsyncSession,
     *,
-    pool_job_config: Optional[dict] = None,
+    base_job_template: Optional[dict] = None,
     deployment_vars: Optional[dict] = None,
-    run_vars: Optional[dict] = None,
-    pool_type: str = "None",
+    run_deployment_job_variables: Optional[dict] = None,
+    work_pool_type: str = "None",
 ):
-    pool_job_config = pool_job_config or {}
+    base_job_template = base_job_template or {}
     deployment_vars = deployment_vars or {}
-    run_vars = run_vars or {}
+    run_deployment_job_variables = run_deployment_job_variables or {}
 
-    wp = await create_work_pool(session, pool_job_config, type=pool_type)
+    wp = await create_work_pool(session, base_job_template, type=work_pool_type)
     deployment = await create_deployment(session, wp, deployment_vars)
-    automation = await create_run_deployment_automation_payload(deployment, run_vars)
+    automation = await create_run_deployment_automation_payload(
+        deployment, run_deployment_job_variables
+    )
 
     await session.commit()
 
     return wp, deployment, automation
-
-
-@pytest.mark.parametrize(
-    "settings",
-    [
-        {
-            PREFECT_EXPERIMENTAL_EVENTS: False,
-        },
-        {
-            PREFECT_API_SERVICES_TRIGGERS_ENABLED: False,
-        },
-    ],
-)
-async def test_returns_404_when_automations_are_disabled(
-    client: AsyncClient,
-    settings: Dict,
-    automations_url: str,
-    automation_to_create: AutomationCreate,
-):
-    with temporary_settings(settings):
-        response = await client.post(
-            f"{automations_url}/",
-            json=automation_to_create.dict(json_compatible=True),
-        )
-
-    assert response.status_code == 404, response.content
 
 
 @pytest.mark.parametrize(
@@ -217,15 +186,19 @@ async def test_returns_404_when_automations_are_disabled(
     ],
 )
 def test_negative_within_not_allowed(invalid_time: timedelta):
-    with pytest.raises(pydantic.ValidationError, match="is 0 seconds"):
+    with pytest.raises(
+        pydantic.ValidationError, match="greater than or equal to 0 seconds"
+    ):
         EventTrigger(posture=Posture.Reactive, threshold=1, within=invalid_time)
 
-    with pytest.raises(pydantic.ValidationError, match="is 0 seconds"):
+    with pytest.raises(
+        pydantic.ValidationError, match="greater than or equal to 10 seconds"
+    ):
         EventTrigger(posture=Posture.Proactive, threshold=1, within=invalid_time)
 
 
 def test_minimum_reactive_within_is_required_but_defaulted():
-    with pytest.raises(pydantic.ValidationError, match="none is not an allowed value"):
+    with pytest.raises(pydantic.ValidationError, match="should be a valid timedelta"):
         EventTrigger(posture=Posture.Reactive, threshold=1, within=None)
 
     trigger = EventTrigger(posture=Posture.Reactive, threshold=1)
@@ -241,12 +214,14 @@ def test_minimum_reactive_within_is_required_but_defaulted():
     ],
 )
 def test_minimum_proactive_within_is_enforced(invalid_time: timedelta):
-    with pytest.raises(pydantic.ValidationError, match="is 10 seconds"):
+    with pytest.raises(
+        pydantic.ValidationError, match="greater than or equal to 10 seconds"
+    ):
         EventTrigger(posture=Posture.Proactive, threshold=1, within=invalid_time)
 
 
 def test_minimum_proactive_within_is_required_but_defaulted():
-    with pytest.raises(pydantic.ValidationError, match="none is not an allowed value"):
+    with pytest.raises(pydantic.ValidationError, match="should be a valid timedelta"):
         EventTrigger(posture=Posture.Proactive, threshold=1, within=None)
 
     trigger = EventTrigger(posture=Posture.Proactive, threshold=1, within=0)
@@ -254,13 +229,6 @@ def test_minimum_proactive_within_is_required_but_defaulted():
 
     trigger = EventTrigger(posture=Posture.Proactive, threshold=1)
     assert trigger.within == timedelta(seconds=10)
-
-
-async def test_minimum_within_is_described_on_api():
-    schema = json.loads(EventTrigger.schema_json())
-    assert schema["properties"]["within"]["default"] == 0.0
-    assert schema["properties"]["within"]["minimum"] == 0.0
-    assert not schema["properties"]["within"]["exclusiveMinimum"]
 
 
 async def test_create_automation_allows_specifying_just_owner_resource(
@@ -274,11 +242,11 @@ async def test_create_automation_allows_specifying_just_owner_resource(
 
     response = await client.post(
         f"{automations_url}/",
-        json=automation_to_create.dict(json_compatible=True),
+        json=automation_to_create.model_dump(mode="json"),
     )
     assert response.status_code == 201, response.content
 
-    created_automation = Automation.parse_raw(response.content)
+    created_automation = Automation.model_validate_json(response.content)
 
     related_automations = await read_automations_related_to_resource(
         session=automations_session,
@@ -310,11 +278,11 @@ async def test_create_automation_allows_specifying_owner_resource_and_actions(
 
     response = await client.post(
         f"{automations_url}/",
-        json=automation_to_create.dict(json_compatible=True),
+        json=automation_to_create.model_dump(mode="json"),
     )
     assert response.status_code == 201, response.content
 
-    created_automation = Automation.parse_raw(response.content)
+    created_automation = Automation.model_validate_json(response.content)
 
     related_automations = await read_automations_related_to_resource(
         session=automations_session,
@@ -359,11 +327,11 @@ async def test_create_automation_overrides_client_provided_trigger_ids(
 
     response = await client.post(
         f"{automations_url}/",
-        json=automation_to_create.dict(json_compatible=True),
+        json=automation_to_create.model_dump(mode="json"),
     )
     assert response.status_code == 201, response.content
 
-    created_automation = Automation.parse_raw(response.content)
+    created_automation = Automation.model_validate_json(response.content)
 
     assert isinstance(created_automation.trigger, CompoundTrigger)
 
@@ -379,7 +347,7 @@ async def existing_automation(
     existing = await create_automation(
         automations_session,
         Automation(
-            **automation_to_create.dict(),
+            **automation_to_create.model_dump(),
         ),
     )
     await automations_session.commit()
@@ -409,7 +377,7 @@ async def existing_disabled_invalid_automation(
     existing = await create_automation(
         automations_session,
         Automation(
-            **automation_to_create.dict(),
+            **automation_to_create.model_dump(),
         ),
     )
     await automations_session.commit()
@@ -418,22 +386,22 @@ async def existing_disabled_invalid_automation(
     assert existing.created
 
     # it should be valid while it's disabled
-    Automation.from_orm(existing)
+    Automation.model_validate(existing, from_attributes=True)
 
     # But not while it's enabled
     existing.enabled = True
     with pytest.raises(pydantic.ValidationError):
-        Automation.from_orm(existing)
+        Automation.model_validate(existing, from_attributes=True)
 
     return existing
 
 
 @pytest.fixture
 def automation_update(existing_automation: Automation) -> AutomationUpdate:
-    as_core = AutomationCore(**existing_automation.dict())
+    as_core = AutomationCore(**existing_automation.model_dump())
     assert as_core.enabled
 
-    update = AutomationUpdate(**as_core.dict())
+    update = AutomationUpdate(**as_core.model_dump())
     update.enabled = False
 
     assert isinstance(update.trigger, EventTrigger)
@@ -452,7 +420,7 @@ async def test_update_automation(
 ) -> None:
     response = await client.put(
         f"{automations_url}/{existing_automation.id}",
-        json=automation_update.dict(json_compatible=True),
+        json=automation_update.model_dump(mode="json"),
     )
     assert response.status_code == 204, response.content
 
@@ -461,7 +429,7 @@ async def test_update_automation(
     )
     assert response.status_code == 200, response.content
 
-    updated_automation = Automation.parse_raw(response.content)
+    updated_automation = Automation.model_validate_json(response.content)
     assert updated_automation.enabled is False
 
     assert isinstance(updated_automation.trigger, EventTrigger)
@@ -480,7 +448,7 @@ async def test_update_automation_404s_on_unknown_id(
 ) -> None:
     response = await client.put(
         f"{automations_url}/{uuid4()}",
-        json=automation_update.dict(json_compatible=True),
+        json=automation_update.model_dump(mode="json"),
     )
     assert response.status_code == 404, response.content
     assert "Automation not found" in response.content.decode()
@@ -492,7 +460,7 @@ async def test_update_automation_cannot_change_id(
     existing_automation: Automation,
     automation_update: AutomationUpdate,
 ) -> None:
-    update = automation_update.dict(json_compatible=True)
+    update = automation_update.model_dump(mode="json")
 
     # try to set an alternative id manually in the payload
     update["id"] = str(uuid4())
@@ -502,7 +470,7 @@ async def test_update_automation_cannot_change_id(
         json=update,
     )
     assert response.status_code == 422, response.content
-    assert "extra fields" in response.content.decode()
+    assert "extra_forbidden" in response.content.decode()
 
 
 async def test_update_automation_overrides_client_provided_trigger_ids(
@@ -521,7 +489,7 @@ async def test_update_automation_overrides_client_provided_trigger_ids(
 
     response = await client.put(
         f"{automations_url}/{existing_automation.id}",
-        json=automation_update.dict(json_compatible=True),
+        json=automation_update.model_dump(mode="json"),
     )
     assert response.status_code == 204, response.content
 
@@ -530,7 +498,7 @@ async def test_update_automation_overrides_client_provided_trigger_ids(
     )
     assert response.status_code == 200, response.content
 
-    updated_automation = Automation.parse_raw(response.content)
+    updated_automation = Automation.model_validate_json(response.content)
 
     assert isinstance(updated_automation.trigger, CompoundTrigger)
 
@@ -540,7 +508,7 @@ async def test_update_automation_overrides_client_provided_trigger_ids(
 
 @pytest.fixture
 def automation_patch(existing_automation: Automation) -> AutomationPartialUpdate:
-    as_core = AutomationCore(**existing_automation.dict())
+    as_core = AutomationCore(**existing_automation.model_dump())
     assert as_core.enabled
     return AutomationPartialUpdate(enabled=False)
 
@@ -553,7 +521,7 @@ async def test_patch_automation(
 ) -> None:
     response = await client.patch(
         f"{automations_url}/{existing_automation.id}",
-        json=automation_patch.dict(json_compatible=True),
+        json=automation_patch.model_dump(mode="json"),
     )
     assert response.status_code == 204, response.content
 
@@ -562,7 +530,7 @@ async def test_patch_automation(
     )
     assert response.status_code == 200, response.content
 
-    updated_automation = Automation.parse_raw(response.content)
+    updated_automation = Automation.model_validate_json(response.content)
     assert updated_automation.enabled is False
 
 
@@ -573,7 +541,7 @@ async def test_patch_automation_404s_on_unknown_id(
 ) -> None:
     response = await client.patch(
         f"{automations_url}/{uuid4()}",
-        json=automation_patch.dict(json_compatible=True),
+        json=automation_patch.model_dump(mode="json"),
     )
     assert response.status_code == 404, response.content
     assert "Automation not found" in response.content.decode()
@@ -585,7 +553,7 @@ async def test_patch_automation_cannot_change_id(
     existing_automation: Automation,
     automation_patch: AutomationPartialUpdate,
 ) -> None:
-    update = automation_patch.dict(json_compatible=True)
+    update = automation_patch.model_dump(mode="json")
 
     # try to set an alternative id manually in the payload
     update["id"] = str(uuid4())
@@ -595,7 +563,7 @@ async def test_patch_automation_cannot_change_id(
         json=update,
     )
     assert response.status_code == 422, response.content
-    assert "extra fields" in response.content.decode()
+    assert "extra_forbidden" in response.content.decode()
 
 
 async def test_patch_automation_cannot_enable_invalid_automation(
@@ -609,7 +577,7 @@ async def test_patch_automation_cannot_enable_invalid_automation(
     info and examples."""
     response = await client.patch(
         f"{automations_url}/{existing_disabled_invalid_automation.id}",
-        json=AutomationPartialUpdate(enabled=True).dict(json_compatible=True),
+        json=AutomationPartialUpdate(enabled=True).model_dump(mode="json"),
     )
     assert response.status_code == 422, response.content
 
@@ -621,9 +589,9 @@ async def test_patch_automation_cannot_enable_invalid_automation(
     assert len(details) == 1
     (detail,) = details
 
-    assert "__root__" in detail["loc"]
+    assert detail["loc"] == []
     assert detail["type"] == "value_error"
-    assert detail["msg"].startswith("Running an inferred deployment")
+    assert "Running an inferred deployment" in detail["msg"]
 
 
 async def test_delete_automation(
@@ -661,7 +629,7 @@ async def test_read_automation(
     response = await client.get(f"{automations_url}/{existing_automation.id}")
     assert response.status_code == 200, response.content
 
-    read_automation = Automation.parse_raw(response.content)
+    read_automation = Automation.model_validate_json(response.content)
     assert read_automation.id
     assert read_automation.name == "hello"
     assert read_automation.description == "world"
@@ -686,7 +654,7 @@ async def test_read_automations(
     response = await client.post(f"{automations_url}/filter")
     assert response.status_code == 200, response.content
 
-    automations = pydantic.parse_obj_as(List[Automation], response.json())
+    automations = parse_obj_as(List[Automation], response.json())
 
     expected = sorted(some_workspace_automations, key=lambda a: a.name)
 
@@ -704,7 +672,7 @@ async def test_read_automations_page(
     )
     assert response.status_code == 200, response.content
 
-    automations = pydantic.parse_obj_as(List[Automation], response.json())
+    automations = parse_obj_as(List[Automation], response.json())
 
     # updated is technically Optional, so assert it here to satisfy the type system
     def by_updated(automation: Automation) -> DateTime:
@@ -715,6 +683,48 @@ async def test_read_automations_page(
     expected = expected[1:3]
 
     assert automations == expected
+
+
+async def test_read_automations_filter_by_name_match(
+    some_workspace_automations: List[Automation],
+    client: AsyncClient,
+    automations_url: str,
+) -> None:
+    automation_filter = dict(
+        automations=filters.AutomationFilter(
+            name=filters.AutomationFilterName(any_=["automation 1", "automation 2"])
+        ).model_dump(mode="json")
+    )
+
+    response = await client.post(f"{automations_url}/filter", json=automation_filter)
+
+    assert response.status_code == 200, response.content
+
+    automations = parse_obj_as(List[Automation], response.json())
+
+    expected = sorted(some_workspace_automations, key=lambda a: a.name)
+    expected = [a for a in expected if a.name in ["automation 1", "automation 2"]]
+
+    assert automations == expected
+    assert len(automations) == 2
+
+
+async def test_read_automations_filter_by_name_mismatch(
+    some_workspace_automations: List[Automation],
+    client: AsyncClient,
+    automations_url: str,
+) -> None:
+    automation_filter = dict(
+        automations=filters.AutomationFilter(
+            name=filters.AutomationFilterName(any_=["nonexistentautomation"])
+        ).model_dump(mode="json")
+    )
+
+    response = await client.post(f"{automations_url}/filter", json=automation_filter)
+
+    assert response.status_code == 200, response.content
+
+    assert response.json() == []
 
 
 async def test_count_automations(
@@ -843,7 +853,7 @@ async def test_read_automations_related_to_resource(
     )
     assert response.status_code == 200, response.content
 
-    returned = pydantic.parse_obj_as(List[Automation], response.json())
+    returned = parse_obj_as(List[Automation], response.json())
     assert returned == [owned, related]
 
 
@@ -908,7 +918,7 @@ async def test_delete_automations_owned_by_resource(
     )
     assert response.status_code == 200, response.content
 
-    returned = pydantic.parse_obj_as(List[Automation], response.json())
+    returned = parse_obj_as(List[Automation], response.json())
     assert {a.id for a in returned} == {related.id, new_owned.id}
 
     for automation in [old_owned, new_owned, related, non_related]:
@@ -927,17 +937,17 @@ async def test_create_run_deployment_automation_with_job_variables_and_no_schema
     run_vars = {"this": "that"}
     *_, run_deployment_with_no_schema = await create_objects_for_automation(
         session,
-        pool_job_config={},
-        run_vars=run_vars,
+        base_job_template={},
+        run_deployment_job_variables=run_vars,
     )
 
     response = await client.post(
         f"{automations_url}/",
-        json=run_deployment_with_no_schema.dict(json_compatible=True),
+        json=run_deployment_with_no_schema.model_dump(mode="json"),
     )
     assert response.status_code == 201, response.content
 
-    created_automation = Automation.parse_raw(response.content)
+    created_automation = Automation.model_validate_json(response.content)
     assert isinstance(created_automation.actions[0], actions.RunDeployment)
     assert created_automation.actions[0].job_variables == run_vars
 
@@ -950,7 +960,7 @@ async def test_create_run_deployment_automation_with_job_variables_that_match_sc
     run_vars = {"this": "is a string"}
     *_, run_deployment_with_schema = await create_objects_for_automation(
         session,
-        pool_job_config={
+        base_job_template={
             "job_configuration": {
                 "thing_one": "{{ this }}",
             },
@@ -960,16 +970,16 @@ async def test_create_run_deployment_automation_with_job_variables_that_match_sc
                 },
             },
         },
-        run_vars=run_vars,
+        run_deployment_job_variables=run_vars,
     )
 
     response = await client.post(
         f"{automations_url}/",
-        json=run_deployment_with_schema.dict(json_compatible=True),
+        json=run_deployment_with_schema.model_dump(mode="json"),
     )
     assert response.status_code == 201, response.content
 
-    created_automation = Automation.parse_raw(response.content)
+    created_automation = Automation.model_validate_json(response.content)
     assert isinstance(created_automation.actions[0], actions.RunDeployment)
     assert created_automation.actions[0].job_variables == run_vars
 
@@ -982,7 +992,7 @@ async def test_create_run_deployment_automation_with_job_variables_that_dont_mat
     run_vars = {"this": 100}
     *_, run_deployment_with_bad_vars = await create_objects_for_automation(
         session,
-        pool_job_config={
+        base_job_template={
             "job_configuration": {
                 "thing_one": "{{ this }}",
             },
@@ -992,17 +1002,15 @@ async def test_create_run_deployment_automation_with_job_variables_that_dont_mat
                 },
             },
         },
-        run_vars=run_vars,
+        run_deployment_job_variables=run_vars,
     )
 
     response = await client.post(
         f"{automations_url}/",
-        json=run_deployment_with_bad_vars.dict(json_compatible=True),
+        json=run_deployment_with_bad_vars.model_dump(mode="json"),
     )
-    assert response.status_code == 409, response.content
-    assert (
-        "Error creating automation: Validation failed for field 'this'" in response.text
-    )
+    assert response.status_code == 422, response.content
+    assert "Validation failed for field 'this'" in response.text
 
 
 async def test_multiple_run_deployment_actions_with_job_variables_that_dont_match_schema(
@@ -1013,7 +1021,7 @@ async def test_multiple_run_deployment_actions_with_job_variables_that_dont_matc
     run_vars = {"this": 100}
     *_, run_deployment_with_bad_vars = await create_objects_for_automation(
         session,
-        pool_job_config={
+        base_job_template={
             "job_configuration": {
                 "thing_one": "{{ this }}",
             },
@@ -1023,7 +1031,7 @@ async def test_multiple_run_deployment_actions_with_job_variables_that_dont_matc
                 },
             },
         },
-        run_vars=run_vars,
+        run_deployment_job_variables=run_vars,
     )
 
     # Copy the same action
@@ -1034,9 +1042,9 @@ async def test_multiple_run_deployment_actions_with_job_variables_that_dont_matc
 
     response = await client.post(
         f"{automations_url}/",
-        json=run_deployment_with_bad_vars.dict(json_compatible=True),
+        json=run_deployment_with_bad_vars.model_dump(mode="json"),
     )
-    assert response.status_code == 409, response.content
+    assert response.status_code == 422, response.content
     assert (
         "Error creating automation: Validation failed for field 'this'" in response.text
     )
@@ -1050,7 +1058,7 @@ async def test_updating_run_deployment_automation_with_bad_job_variables(
     run_vars = {"this": "that"}
     *_, run_deployment_with_str_schema = await create_objects_for_automation(
         session,
-        pool_job_config={
+        base_job_template={
             "job_configuration": {
                 "thing_one": "{{ this }}",
             },
@@ -1060,30 +1068,131 @@ async def test_updating_run_deployment_automation_with_bad_job_variables(
                 },
             },
         },
-        run_vars=run_vars,
+        run_deployment_job_variables=run_vars,
     )
 
     response = await client.post(
         f"{automations_url}/",
-        json=run_deployment_with_str_schema.dict(json_compatible=True),
+        json=run_deployment_with_str_schema.model_dump(mode="json"),
     )
     assert response.status_code == 201, response.content
 
     automation_id = response.json()["id"]
     as_core = AutomationCore(**response.json())
-    update = AutomationUpdate(**as_core.dict())
+    update = AutomationUpdate(**as_core.model_dump())
     assert isinstance(update.actions[0], actions.RunDeployment)
 
     update.actions[0].job_variables = {"this": 100}
 
     response = await client.put(
         f"{automations_url}/{automation_id}",
-        json=update.dict(json_compatible=True),
+        json=update.model_dump(mode="json"),
     )
-    assert response.status_code == 409
+    assert response.status_code == 422
     assert (
         "Error creating automation: Validation failed for field 'this'" in response.text
     )
+
+
+async def test_create_run_deployment_automation_with_none_variable_value(
+    client: AsyncClient,
+    automations_url: str,
+    session: AsyncSession,
+) -> None:
+    """
+    A regression test for broken JSON schema validation in #7555.
+    """
+    # The RunDeployment action will try to use a `None` value for this job var.
+    # It should work because Pydantic schemas allow None values for optional
+    # fields.
+    run_vars = {"profile_name": None}
+    *_, run_deployment_with_str_schema = await create_objects_for_automation(
+        session,
+        base_job_template={
+            "job_configuration": {
+                "name": "{{ profile_name }}",
+            },
+            "variables": {
+                "properties": {
+                    "profile_name": {
+                        "title": "Profile Name",
+                        "description": "The profile to use when creating your session.",
+                        "type": "string",
+                    },
+                },
+            },
+        },
+        run_deployment_job_variables=run_vars,
+    )
+
+    response = await client.post(
+        f"{automations_url}/",
+        json=run_deployment_with_str_schema.model_dump(mode="json"),
+    )
+    assert response.status_code == 201, response.content
+
+    automation_id = response.json()["id"]
+    response = await client.get(f"{automations_url}/{automation_id}")
+    created_automation = Automation.model_validate_json(response.content)
+    assert isinstance(created_automation.actions[0], actions.RunDeployment)
+    assert created_automation.actions[0].job_variables == {"profile_name": None}
+
+
+async def test_updating_run_deployment_automation_with_none_variable_value(
+    client: AsyncClient,
+    automations_url: str,
+    session: AsyncSession,
+) -> None:
+    """
+    A regression test for broken JSON schema validation in #7555.
+    """
+    # The RunDeployment action will try to use a `None` value for this job var.
+    # It should work because Pydantic schemas allow None values for optional
+    # fields.
+    run_vars = {"profile_name": "andrew"}
+    *_, run_deployment_with_str_schema = await create_objects_for_automation(
+        session,
+        base_job_template={
+            "job_configuration": {
+                "name": "{{ profile_name }}",
+            },
+            "variables": {
+                "properties": {
+                    "profile_name": {
+                        "title": "Profile Name",
+                        "description": "The profile to use when creating your session.",
+                        "type": "string",
+                    },
+                },
+            },
+        },
+        run_deployment_job_variables=run_vars,
+    )
+
+    response = await client.post(
+        f"{automations_url}/",
+        json=run_deployment_with_str_schema.model_dump(mode="json"),
+    )
+    assert response.status_code == 201, response.content
+
+    automation_id = response.json()["id"]
+    as_core = AutomationCore(**response.json())
+    update = AutomationUpdate(**as_core.model_dump())
+    assert isinstance(update.actions[0], actions.RunDeployment)
+    assert update.actions[0].job_variables == {"profile_name": "andrew"}
+
+    update.actions[0].job_variables = {"profile_name": None}
+
+    response = await client.put(
+        f"{automations_url}/{automation_id}",
+        json=update.model_dump(mode="json"),
+    )
+    assert response.status_code == 204
+
+    response = await client.get(f"{automations_url}/{automation_id}")
+    updated_automation = Automation.model_validate_json(response.content)
+    assert isinstance(updated_automation.actions[0], actions.RunDeployment)
+    assert updated_automation.actions[0].job_variables == {"profile_name": None}
 
 
 async def test_updating_run_deployment_automation_with_valid_job_variables(
@@ -1094,7 +1203,7 @@ async def test_updating_run_deployment_automation_with_valid_job_variables(
     run_vars = {"this": "that"}
     *_, run_deployment_with_str_schema = await create_objects_for_automation(
         session,
-        pool_job_config={
+        base_job_template={
             "job_configuration": {
                 "thing_one": "{{ this }}",
             },
@@ -1104,29 +1213,29 @@ async def test_updating_run_deployment_automation_with_valid_job_variables(
                 },
             },
         },
-        run_vars=run_vars,
+        run_deployment_job_variables=run_vars,
     )
 
     response = await client.post(
         f"{automations_url}/",
-        json=run_deployment_with_str_schema.dict(json_compatible=True),
+        json=run_deployment_with_str_schema.model_dump(mode="json"),
     )
     assert response.status_code == 201, response.content
 
     automation_id = response.json()["id"]
     as_core = AutomationCore(**response.json())
-    update = AutomationUpdate(**as_core.dict())
+    update = AutomationUpdate(**as_core.model_dump())
     assert isinstance(update.actions[0], actions.RunDeployment)
     update.actions[0].job_variables = {"this": "something else!!"}
 
     response = await client.put(
         f"{automations_url}/{automation_id}",
-        json=update.dict(json_compatible=True),
+        json=update.model_dump(mode="json"),
     )
     assert response.status_code == 204
 
     response = await client.get(f"{automations_url}/{automation_id}")
-    updated_automation = Automation.parse_raw(response.content)
+    updated_automation = Automation.model_validate_json(response.content)
     assert isinstance(updated_automation.actions[0], actions.RunDeployment)
     assert updated_automation.actions[0].job_variables == {"this": "something else!!"}
 
@@ -1138,17 +1247,17 @@ async def test_infrastructure_error_inside_create(
 ) -> None:
     *_, run_deployment_with_str_schema = await create_objects_for_automation(
         session,
-        pool_job_config={},
-        run_vars={"this": "that"},
+        base_job_template={},
+        run_deployment_job_variables={"this": "that"},
     )
 
     with mock.patch(
-        "prefect.server.api.automations._validate_run_deployment_action_against_pool_schema",
-        side_effect=FlowRunInfrastructureMissing("Something is wrong"),
+        "prefect.server.api.automations.validate_job_variables_for_run_deployment_action",
+        side_effect=ValidationError("Something is wrong"),
     ):
         response = await client.post(
             f"{automations_url}/",
-            json=run_deployment_with_str_schema.dict(json_compatible=True),
+            json=run_deployment_with_str_schema.model_dump(mode="json"),
         )
-        assert response.status_code == 409, response.content
+        assert response.status_code == 422, response.content
         assert "Error creating automation: Something is wrong" in response.text

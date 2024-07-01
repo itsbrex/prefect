@@ -4,12 +4,15 @@ import sys
 from typing import Dict, List, Set
 
 PYTHON_VERSIONS = [
-    "3.8",
     "3.9",
     "3.10",
     "3.11",
     "3.12",
 ]
+
+SKIP_VERSIONS = {
+    "prefect-ray": ["3.12"],
+}
 
 
 def get_changed_packages(commit_range: str) -> List[str]:
@@ -34,6 +37,8 @@ def generate_matrix(packages: List[str], python_versions: List[str]) -> Dict:
     matrix = {"include": []}
     for package in packages:
         for version in python_versions:
+            if version in SKIP_VERSIONS.get(package, []):
+                continue
             matrix["include"].append({"package": package, "python-version": version})
     return matrix
 

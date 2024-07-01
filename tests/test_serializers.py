@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic import BaseModel, ValidationError, field_validator
 
-from prefect.pydantic import HAS_PYDANTIC_V2
 from prefect.serializers import (
     CompressedSerializer,
     JSONSerializer,
@@ -17,12 +17,6 @@ from prefect.serializers import (
 )
 from prefect.testing.utilities import exceptions_equal
 from prefect.utilities.dispatch import get_registry_for_type
-
-if HAS_PYDANTIC_V2:
-    from pydantic.v1 import BaseModel, ValidationError, validator
-
-else:
-    from pydantic import BaseModel, ValidationError, validator
 
 # Freeze a UUID for deterministic tests
 TEST_UUID = uuid.UUID("a53e3495-d681-4a53-84b8-9d9542f7237c")
@@ -83,7 +77,7 @@ class TestBaseSerializer:
 
     def test_serializers_do_not_allow_extra_fields(self):
         class Foo(Serializer):
-            type = "foo"
+            type: str = "foo"
 
             def dumps(self, obj):
                 pass
@@ -99,7 +93,7 @@ class TestBaseSerializer:
             serializer: Serializer
 
         class Bar(Serializer):
-            type = "bar"
+            type: str = "bar"
 
             def dumps(self, obj):
                 pass
@@ -115,7 +109,7 @@ class TestBaseSerializer:
             serializer: Serializer
 
         class Bar(Serializer):
-            type = "bar"
+            type: str = "bar"
 
             def dumps(self, obj):
                 pass
@@ -130,14 +124,14 @@ class TestBaseSerializer:
         class Foo(BaseModel):
             serializer: Serializer
 
-            @validator("serializer", pre=True)
+            @field_validator("serializer", mode="before")
             def cast_type_to_dict(cls, value):
                 if isinstance(value, str):
                     return {"type": value}
                 return value
 
         class Bar(Serializer):
-            type = "bar"
+            type: str = "bar"
 
             def dumps(self, obj):
                 pass
@@ -260,14 +254,18 @@ class TestJSONSerializer:
         prefect_object_encoder = MagicMock()
 
         monkeypatch.setattr(
-            "prefect.fake_object_encoder", fake_object_encoder, raising=False
+            "prefect.serializers.fake_object_encoder",
+            fake_object_encoder,
+            raising=False,
         )
         monkeypatch.setattr(
             "prefect.serializers.prefect_json_object_encoder",
             prefect_object_encoder,
         )
 
-        serializer = JSONSerializer(object_encoder="prefect.fake_object_encoder")
+        serializer = JSONSerializer(
+            object_encoder="prefect.serializers.fake_object_encoder"
+        )
 
         # Encoder hooks are only called for unsupported objects
         obj = uuid.uuid4()
@@ -281,7 +279,9 @@ class TestJSONSerializer:
         prefect_object_decoder = MagicMock()
 
         monkeypatch.setattr(
-            "prefect.fake_object_decoder", fake_object_decoder, raising=False
+            "prefect.serializers.fake_object_decoder",
+            fake_object_decoder,
+            raising=False,
         )
 
         monkeypatch.setattr(
@@ -289,7 +289,9 @@ class TestJSONSerializer:
             prefect_object_decoder,
         )
 
-        serializer = JSONSerializer(object_decoder="prefect.fake_object_decoder")
+        serializer = JSONSerializer(
+            object_decoder="prefect.serializers.fake_object_decoder"
+        )
 
         # Decoder hooks are only called for dicts
         assert serializer.loads(json.dumps({"foo": "bar"}).encode()) == "test"

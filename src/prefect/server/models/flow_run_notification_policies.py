@@ -4,13 +4,15 @@ Intended for internal use by the Prefect REST API.
 """
 
 import textwrap
+from typing import Optional
 from uuid import UUID
 
 import sqlalchemy as sa
 from sqlalchemy import delete, select
 
 import prefect.server.schemas as schemas
-from prefect.server.database.dependencies import inject_db
+from prefect.server.database import orm_models
+from prefect.server.database.dependencies import db_injector
 from prefect.server.database.interface import PrefectDBInterface
 
 DEFAULT_MESSAGE_TEMPLATE = textwrap.dedent(
@@ -25,11 +27,9 @@ DEFAULT_MESSAGE_TEMPLATE = textwrap.dedent(
 )
 
 
-@inject_db
 async def create_flow_run_notification_policy(
     session: sa.orm.Session,
     flow_run_notification_policy: schemas.core.FlowRunNotificationPolicy,
-    db: PrefectDBInterface,
 ):
     """
     Creates a FlowRunNotificationPolicy.
@@ -39,21 +39,21 @@ async def create_flow_run_notification_policy(
         flow_run_notification_policy (schemas.core.FlowRunNotificationPolicy): a FlowRunNotificationPolicy model
 
     Returns:
-        db.FlowRunNotificationPolicy: the newly-created FlowRunNotificationPolicy
+        orm_models.FlowRunNotificationPolicy: the newly-created FlowRunNotificationPolicy
 
     """
-    model = db.FlowRunNotificationPolicy(**flow_run_notification_policy.dict())
+    model = orm_models.FlowRunNotificationPolicy(
+        **flow_run_notification_policy.model_dump()
+    )
     session.add(model)
     await session.flush()
 
     return model
 
 
-@inject_db
 async def read_flow_run_notification_policy(
     session: sa.orm.Session,
     flow_run_notification_policy_id: UUID,
-    db: PrefectDBInterface,
 ):
     """
     Reads a FlowRunNotificationPolicy by id.
@@ -67,17 +67,17 @@ async def read_flow_run_notification_policy(
     """
 
     return await session.get(
-        db.FlowRunNotificationPolicy, flow_run_notification_policy_id
+        orm_models.FlowRunNotificationPolicy, flow_run_notification_policy_id
     )
 
 
-@inject_db
 async def read_flow_run_notification_policies(
-    db: PrefectDBInterface,
     session: sa.orm.Session,
-    flow_run_notification_policy_filter: schemas.filters.FlowRunNotificationPolicyFilter = None,
-    offset: int = None,
-    limit: int = None,
+    flow_run_notification_policy_filter: Optional[
+        schemas.filters.FlowRunNotificationPolicyFilter
+    ] = None,
+    offset: Optional[int] = None,
+    limit: Optional[int] = None,
 ):
     """
     Read notification policies.
@@ -91,12 +91,12 @@ async def read_flow_run_notification_policies(
         List[db.FlowRunNotificationPolicy]: Notification policies
     """
 
-    query = select(db.FlowRunNotificationPolicy).order_by(
-        db.FlowRunNotificationPolicy.id
+    query = select(orm_models.FlowRunNotificationPolicy).order_by(
+        orm_models.FlowRunNotificationPolicy.id
     )
 
     if flow_run_notification_policy_filter:
-        query = query.where(flow_run_notification_policy_filter.as_sql_filter(db))
+        query = query.where(flow_run_notification_policy_filter.as_sql_filter())
 
     if offset is not None:
         query = query.offset(offset)
@@ -107,12 +107,10 @@ async def read_flow_run_notification_policies(
     return result.scalars().unique().all()
 
 
-@inject_db
 async def update_flow_run_notification_policy(
     session: sa.orm.Session,
     flow_run_notification_policy_id: UUID,
     flow_run_notification_policy: schemas.actions.FlowRunNotificationPolicyUpdate,
-    db: PrefectDBInterface,
 ) -> bool:
     """
     Update a FlowRunNotificationPolicy by id.
@@ -127,22 +125,22 @@ async def update_flow_run_notification_policy(
     """
     # exclude_unset=True allows us to only update values provided by
     # the user, ignoring any defaults on the model
-    update_data = flow_run_notification_policy.dict(shallow=True, exclude_unset=True)
+    update_data = flow_run_notification_policy.model_dump_for_orm(exclude_unset=True)
 
     update_stmt = (
-        sa.update(db.FlowRunNotificationPolicy)
-        .where(db.FlowRunNotificationPolicy.id == flow_run_notification_policy_id)
+        sa.update(orm_models.FlowRunNotificationPolicy)
+        .where(
+            orm_models.FlowRunNotificationPolicy.id == flow_run_notification_policy_id
+        )
         .values(**update_data)
     )
     result = await session.execute(update_stmt)
     return result.rowcount > 0
 
 
-@inject_db
 async def delete_flow_run_notification_policy(
     session: sa.orm.Session,
     flow_run_notification_policy_id: UUID,
-    db: PrefectDBInterface,
 ) -> bool:
     """
     Delete a FlowRunNotificationPolicy by id.
@@ -156,18 +154,18 @@ async def delete_flow_run_notification_policy(
     """
 
     result = await session.execute(
-        delete(db.FlowRunNotificationPolicy).where(
-            db.FlowRunNotificationPolicy.id == flow_run_notification_policy_id
+        delete(orm_models.FlowRunNotificationPolicy).where(
+            orm_models.FlowRunNotificationPolicy.id == flow_run_notification_policy_id
         )
     )
     return result.rowcount > 0
 
 
-@inject_db
+@db_injector
 async def queue_flow_run_notifications(
+    db: PrefectDBInterface,
     session: sa.orm.session,
     flow_run: schemas.core.FlowRun,
-    db: PrefectDBInterface,
 ):
     await db.queries.queue_flow_run_notifications(
         session=session, flow_run=flow_run, db=db

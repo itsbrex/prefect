@@ -31,7 +31,7 @@ RESOURCE_CACHE: RelatedResourceCache = {}
 
 def tags_as_related_resources(tags: Iterable[str]) -> List[RelatedResource]:
     return [
-        RelatedResource.parse_obj(
+        RelatedResource.model_validate(
             {
                 "prefect.resource.id": f"prefect.tag.{tag}",
                 "prefect.resource.role": "tag",
@@ -44,7 +44,7 @@ def tags_as_related_resources(tags: Iterable[str]) -> List[RelatedResource]:
 def object_as_related_resource(kind: str, role: str, object: Any) -> RelatedResource:
     resource_id = f"prefect.{kind}.{object.id}"
 
-    return RelatedResource.parse_obj(
+    return RelatedResource.model_validate(
         {
             "prefect.resource.id": resource_id,
             "prefect.resource.role": role,
@@ -57,6 +57,7 @@ async def related_resources_from_run_context(
     exclude: Optional[Set[str]] = None,
 ) -> List[RelatedResource]:
     from prefect.client.orchestration import get_client
+    from prefect.client.schemas.objects import FlowRun
     from prefect.context import FlowRunContext, TaskRunContext
 
     if exclude is None:
@@ -111,7 +112,7 @@ async def related_resources_from_run_context(
 
         flow_run = related_objects[0]["object"]
 
-        if flow_run:
+        if isinstance(flow_run, FlowRun):
             related_objects += list(
                 await asyncio.gather(
                     _get_and_cache_related_object(

@@ -2,13 +2,7 @@ import datetime
 from uuid import uuid4
 
 import pytest
-
-from prefect._internal.pydantic import HAS_PYDANTIC_V2
-
-if HAS_PYDANTIC_V2:
-    import pydantic.v1 as pydantic
-else:
-    import pydantic
+from pydantic import TypeAdapter, ValidationError
 
 from prefect.events import (
     AutomationCore,
@@ -28,10 +22,12 @@ from prefect.events.schemas.deployment_triggers import (
     DeploymentTriggerTypes,
 )
 
+deployment_trigger_adapter = TypeAdapter(DeploymentTriggerTypes)
+
 
 def test_deployment_trigger_defaults_to_empty_reactive_trigger():
-    trigger = pydantic.parse_obj_as(
-        DeploymentTriggerTypes, {"name": "A deployment automation"}
+    trigger = deployment_trigger_adapter.validate_python(
+        {"name": "A deployment automation"}
     )
     assert isinstance(trigger, DeploymentEventTrigger)
     trigger.set_deployment_id(uuid4())
@@ -47,14 +43,16 @@ def test_deployment_trigger_defaults_to_empty_reactive_trigger():
     assert automation.trigger.expect == set()
 
 
-def test_deployment_trigger_requires_name_but_can_have_it_set_later():
-    trigger = pydantic.parse_obj_as(DeploymentTriggerTypes, {})
+def test_deployment_trigger_defaults_name_but_can_have_it_overridden():
+    trigger = deployment_trigger_adapter.validate_python({})
     assert isinstance(trigger, DeploymentEventTrigger)
 
-    trigger.set_deployment_id(uuid4())
+    deployment_id = uuid4()
 
-    with pytest.raises(ValueError, match="name is required"):
-        trigger.as_automation()
+    trigger.set_deployment_id(deployment_id)
+
+    automation = trigger.as_automation()
+    assert automation.name == f"Automation for deployment {deployment_id}"
 
     trigger.name = "A deployment automation"
     automation = trigger.as_automation()
@@ -63,8 +61,8 @@ def test_deployment_trigger_requires_name_but_can_have_it_set_later():
 
 
 def test_deployment_trigger_defaults_to_reactive_event_trigger():
-    trigger = pydantic.parse_obj_as(
-        DeploymentTriggerTypes, {"name": "A deployment automation"}
+    trigger = deployment_trigger_adapter.validate_python(
+        {"name": "A deployment automation"}
     )
     assert isinstance(trigger, DeploymentEventTrigger)
     trigger.set_deployment_id(uuid4())
@@ -93,8 +91,7 @@ def test_deployment_trigger_defaults_to_reactive_event_trigger():
 
 
 def test_deployment_trigger_proactive_trigger_with_defaults():
-    trigger = pydantic.parse_obj_as(
-        DeploymentTriggerTypes,
+    trigger = deployment_trigger_adapter.validate_python(
         {"name": "A deployment automation", "posture": "Proactive"},
     )
     assert isinstance(trigger, DeploymentEventTrigger)
@@ -124,9 +121,8 @@ def test_deployment_trigger_proactive_trigger_with_defaults():
 
 
 def test_deployment_reactive_trigger_disallows_negative_withins():
-    with pytest.raises(pydantic.ValidationError, match="minimum .?within.?"):
-        pydantic.parse_obj_as(
-            DeploymentTriggerTypes,
+    with pytest.raises(ValidationError, match="greater than or equal to 0 seconds"):
+        deployment_trigger_adapter.validate_python(
             {
                 "name": "A deployment automation",
                 "posture": "Reactive",
@@ -136,9 +132,8 @@ def test_deployment_reactive_trigger_disallows_negative_withins():
 
 
 def test_deployment_proactive_trigger_disallows_negative_withins():
-    with pytest.raises(pydantic.ValidationError, match="minimum .?within.?"):
-        pydantic.parse_obj_as(
-            DeploymentTriggerTypes,
+    with pytest.raises(ValidationError, match="greater than or equal to 10 seconds"):
+        deployment_trigger_adapter.validate_python(
             {
                 "name": "A deployment automation",
                 "posture": "Proactive",
@@ -148,9 +143,8 @@ def test_deployment_proactive_trigger_disallows_negative_withins():
 
 
 def test_deployment_trigger_proactive_trigger_disallows_short_withins():
-    with pytest.raises(pydantic.ValidationError, match="minimum .?within.?"):
-        pydantic.parse_obj_as(
-            DeploymentTriggerTypes,
+    with pytest.raises(ValidationError, match="greater than or equal to 10 seconds"):
+        deployment_trigger_adapter.validate_python(
             {
                 "name": "A deployment automation",
                 "posture": "Proactive",
@@ -160,8 +154,7 @@ def test_deployment_trigger_proactive_trigger_disallows_short_withins():
 
 
 def test_deployment_trigger_metric_trigger():
-    trigger = pydantic.parse_obj_as(
-        DeploymentTriggerTypes,
+    trigger = deployment_trigger_adapter.validate_python(
         {
             "name": "A deployment automation",
             "posture": "Metric",
@@ -193,13 +186,12 @@ def test_deployment_trigger_metric_trigger():
 
 
 def test_compound_deployment_trigger_as_automation():
-    trigger = pydantic.parse_obj_as(
-        DeploymentTriggerTypes,
+    trigger = deployment_trigger_adapter.validate_python(
         {
             "name": "A deployment automation",
             "type": "compound",
             "require": "all",
-            "within": "42",
+            "within": 42,
             "triggers": [
                 {"expect": ["foo.bar"]},
                 {"expect": ["buz.baz"]},
@@ -246,13 +238,12 @@ def test_compound_deployment_trigger_as_automation():
 
 
 def test_deeply_nested_compound_deployment_trigger_as_automation():
-    trigger = pydantic.parse_obj_as(
-        DeploymentTriggerTypes,
+    trigger = deployment_trigger_adapter.validate_python(
         {
             "name": "A deployment automation",
             "type": "compound",
             "require": "all",
-            "within": "42",
+            "within": 42,
             "triggers": [
                 {
                     "type": "compound",
@@ -333,8 +324,7 @@ def test_deeply_nested_compound_deployment_trigger_as_automation():
 
 
 def test_sequence_deployment_trigger_as_automation():
-    trigger = pydantic.parse_obj_as(
-        DeploymentTriggerTypes,
+    trigger = deployment_trigger_adapter.validate_python(
         {
             "name": "A deployment automation",
             "type": "sequence",

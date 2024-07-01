@@ -59,6 +59,54 @@ async def test_reading_automations_by_workspace_by_name(
     ]
 
 
+async def test_reading_automations_by_workspace_by_name_filtered_match(
+    automations_session: AsyncSession,
+    some_workspace_automations: Sequence[Automation],
+):
+    existing = await automations.read_automations_for_workspace(
+        session=automations_session,
+        sort=AutomationSort.NAME_ASC,
+        automation_filter=filters.AutomationFilter(name={"any_": ["automation 2"]}),
+    )
+
+    assert len(existing) == 1
+
+    assert existing[0].name == "automation 2"
+
+
+async def test_reading_automations_by_workspace_by_name_filtered_match_many(
+    automations_session: AsyncSession,
+    some_workspace_automations: Sequence[Automation],
+):
+    existing = await automations.read_automations_for_workspace(
+        session=automations_session,
+        sort=AutomationSort.NAME_ASC,
+        automation_filter=filters.AutomationFilter(
+            name={"any_": ["automation 2", "automation 3"]}
+        ),
+    )
+
+    assert len(existing) == 2
+
+    assert [automation.name for automation in existing] == [
+        "automation 2",
+        "automation 3",
+    ]
+
+
+async def test_reading_automations_by_workspace_by_name_filtered_mismatch(
+    automations_session: AsyncSession,
+    some_workspace_automations: Sequence[Automation],
+):
+    existing = await automations.read_automations_for_workspace(
+        session=automations_session,
+        sort=AutomationSort.NAME_ASC,
+        automation_filter=filters.AutomationFilter(name={"any_": ["automation 5"]}),
+    )
+
+    assert len(existing) == 0
+
+
 async def test_reading_automations_by_workspace_paging(
     automations_session: AsyncSession,
     some_workspace_automations: Sequence[Automation],
@@ -131,7 +179,7 @@ async def test_creating_automation(automations_session: AsyncSession):
         name="a fresh automation for ya",
         trigger=EventTrigger(
             expect={"things.happened"},
-            match=ResourceSpecification.parse_obj(
+            match=ResourceSpecification.model_validate(
                 {"prefect.resource.id": "some-resource"}
             ),
             posture=Posture.Reactive,
@@ -142,7 +190,7 @@ async def test_creating_automation(automations_session: AsyncSession):
     )
     # This is what the models require
     automation = Automation(
-        **automation_request.dict(),
+        **automation_request.model_dump(),
     )
     saved_automation = await automations.create_automation(
         session=automations_session,
@@ -178,7 +226,7 @@ async def existing_automation(
         name="a automation that is already here, thank you",
         trigger=EventTrigger(
             expect=("things.happened",),
-            match=ResourceSpecification.parse_obj(
+            match=ResourceSpecification.model_validate(
                 {"prefect.resource.id": "some-resource"}
             ),
             posture=Posture.Reactive,
@@ -189,17 +237,17 @@ async def existing_automation(
     )
     automations_session.add(automation)
     await automations_session.flush()
-    return Automation.from_orm(automation)
+    return Automation.model_validate(automation, from_attributes=True)
 
 
 async def test_updating_automation_that_exists(
     automations_session: AsyncSession, existing_automation: Automation
 ):
     # take it to a core schema first to remove unexpected fields
-    as_core = AutomationCore(**existing_automation.dict())
+    as_core = AutomationCore(**existing_automation.model_dump())
     assert as_core.enabled
 
-    update = AutomationUpdate(**as_core.dict())
+    update = AutomationUpdate(**as_core.model_dump())
     update.enabled = False
     assert isinstance(update.trigger, EventTrigger)
     update.trigger.expect = {"things.definitely.did.not.happen", "or.maybe.not"}
@@ -233,7 +281,7 @@ async def test_updating_automation_that_exists(
 
     # these should remain the same
     assert reloaded_automation.name == "a automation that is already here, thank you"
-    assert reloaded_automation.trigger.match == ResourceSpecification.parse_obj(
+    assert reloaded_automation.trigger.match == ResourceSpecification.model_validate(
         {"prefect.resource.id": "some-resource"}
     )
     assert reloaded_automation.trigger.posture == Posture.Reactive
@@ -243,7 +291,7 @@ async def test_partially_updating_automation_that_exists(
     automations_session: AsyncSession, existing_automation: Automation
 ):
     # take it to a core schema first to remove unexpected fields
-    as_core = AutomationCore(**existing_automation.dict())
+    as_core = AutomationCore(**existing_automation.model_dump())
     assert as_core.enabled
 
     partial_update = AutomationPartialUpdate(enabled=False)
@@ -268,7 +316,7 @@ async def test_partially_updating_automation_that_exists(
 
     # these should remain the same
     assert reloaded_automation.name == "a automation that is already here, thank you"
-    assert reloaded_automation.trigger.match == ResourceSpecification.parse_obj(
+    assert reloaded_automation.trigger.match == ResourceSpecification.model_validate(
         {"prefect.resource.id": "some-resource"}
     )
     assert reloaded_automation.trigger.posture == Posture.Reactive
@@ -283,7 +331,7 @@ async def test_updating_automation_that_does_not_exist(
         name="well this is terribly awkward",
         trigger=EventTrigger(
             expect=("things.happened",),
-            match=ResourceSpecification.parse_obj(
+            match=ResourceSpecification.model_validate(
                 {"prefect.resource.id": "some-resource"}
             ),
             posture=Posture.Reactive,
@@ -315,7 +363,7 @@ async def test_updating_automation_with_create_schema_is_not_allowed(
         name="well this is terribly awkward",
         trigger=EventTrigger(
             expect=("things.happened",),
-            match=ResourceSpecification.parse_obj(
+            match=ResourceSpecification.model_validate(
                 {"prefect.resource.id": "some-resource"}
             ),
             posture=Posture.Reactive,
@@ -491,7 +539,9 @@ async def test_deleting_automations_owned_by_resource(
 def uninteresting_trigger() -> EventTrigger:
     return EventTrigger(
         expect={"things.happened"},
-        match=ResourceSpecification.parse_obj({"prefect.resource.id": "some-resource"}),
+        match=ResourceSpecification.model_validate(
+            {"prefect.resource.id": "some-resource"}
+        ),
         posture=Posture.Reactive,
         threshold=42,
         within=timedelta(seconds=42),
@@ -517,7 +567,7 @@ async def test_creating_automation_creates_relations_to_resources(
     )
     # This is what the models require
     automation = Automation(
-        **automation_request.dict(),
+        **automation_request.model_dump(),
     )
 
     new_automation = await automations.create_automation(
@@ -558,7 +608,7 @@ async def test_creating_automation_skips_relating_inferred_deployments(
     )
     # This is what the models require
     automation = Automation(
-        **automation_request.dict(),
+        **automation_request.model_dump(),
     )
 
     new_automation = await automations.create_automation(
@@ -600,7 +650,7 @@ async def existing_related_automation(
     automation = await automations.create_automation(
         session=automations_session,
         automation=Automation(
-            **automation_request.dict(),
+            **automation_request.model_dump(),
         ),
     )
 
@@ -812,7 +862,7 @@ async def test_disabling_automation_that_exists(
     automations_session: AsyncSession, existing_automation: Automation
 ):
     # take it to a core schema first to remove unexpected fields
-    as_core = AutomationCore(**existing_automation.dict())
+    as_core = AutomationCore(**existing_automation.model_dump())
     assert as_core.enabled
 
     result = await automations.disable_automation(
@@ -834,7 +884,7 @@ async def test_disabling_automation_that_exists(
 
     # these should remain the same
     assert reloaded_automation.name == "a automation that is already here, thank you"
-    assert reloaded_automation.trigger.match == ResourceSpecification.parse_obj(
+    assert reloaded_automation.trigger.match == ResourceSpecification.model_validate(
         {"prefect.resource.id": "some-resource"}
     )
     assert reloaded_automation.trigger.posture == Posture.Reactive

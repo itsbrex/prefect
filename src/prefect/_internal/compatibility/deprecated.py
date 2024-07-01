@@ -9,21 +9,15 @@ Deprecated items require a start or end date. If a start date is given, the end 
 will be calculated 6 months later. Start and end dates are always in the format MMM YYYY
 e.g. Jan 2023.
 """
+
 import functools
 import sys
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, Union
+from typing import Any, Callable, List, Optional, Type, TypeVar
 
 import pendulum
-
-from prefect._internal.pydantic import HAS_PYDANTIC_V2
-
-if HAS_PYDANTIC_V2:
-    from pydantic.v1 import BaseModel, Field, root_validator
-    from pydantic.v1.schema import default_ref_template
-else:
-    from pydantic import BaseModel, Field, root_validator
-    from pydantic.schema import default_ref_template
+import wrapt
+from pydantic import BaseModel
 
 from prefect.utilities.callables import get_call_parameters
 from prefect.utilities.importtools import (
@@ -237,9 +231,10 @@ def deprecated_field(
 
             cls_init(__pydantic_self__, **data)
 
-            field = __pydantic_self__.__fields__.get(name)
+            field = __pydantic_self__.model_fields.get(name)
             if field is not None:
-                field.field_info.extra["deprecated"] = True
+                field.json_schema_extra = field.json_schema_extra or {}
+                field.json_schema_extra["deprecated"] = True
 
         # Patch the model's init method
         model_cls.__init__ = __init__
@@ -280,104 +275,53 @@ def register_renamed_module(old_name: str, new_name: str, start_date: str):
     )
 
 
-class DeprecatedInfraOverridesField(BaseModel):
+class AsyncCompatProxy(wrapt.ObjectProxy):
     """
-    A model mixin that handles the deprecated `infra_overrides` field.
+    A proxy object that allows for awaiting a method that is no longer async.
 
-    The `infra_overrides` field has been renamed to `job_variables`. This mixin maintains
-    backwards compatibility with users of the `infra_overrides` field while presenting
-    `job_variables` as the user-facing field.
-
-    When we remove support for `infra_overrides`, we can remove this class as a parent of
-    all schemas that use it, leaving them with only the `job_variables` field.
+    See https://wrapt.readthedocs.io/en/master/wrappers.html#object-proxy for more
     """
 
-    infra_overrides: Optional[Dict[str, Any]] = Field(
-        default_factory=dict,
-        description="Deprecated field. Use `job_variables` instead.",
-    )
+    def __init__(self, wrapped, class_name: str, method_name: str):
+        super().__init__(wrapped)
+        self._self_class_name = class_name
+        self._self_method_name = method_name
+        self._self_already_awaited = False
 
-    @root_validator(pre=True)
-    def _job_variables_from_infra_overrides(
-        cls, values: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """
-        Validate that only one of `infra_overrides` or `job_variables` is used
-        and keep them in sync during init.
-        """
-        job_variables = values.get("job_variables")
-        infra_overrides = values.get("infra_overrides")
+    def __await__(self):
+        if not self._self_already_awaited:
+            warnings.warn(
+                (
+                    f"The {self._self_method_name!r} method on {self._self_class_name!r}"
+                    " is no longer async and awaiting it will raise an error after Dec 2024"
+                    " - please remove the `await` keyword."
+                ),
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self._self_already_awaited = True
+        yield
+        return self.__wrapped__
 
-        if job_variables is not None and infra_overrides is not None:
-            if job_variables != infra_overrides:
-                raise ValueError(
-                    "The `infra_overrides` field has been renamed to `job_variables`."
-                    "Use one of these fields, but not both."
-                )
-            return values
-        elif job_variables is not None and infra_overrides is None:
-            values["infra_overrides"] = job_variables
-        elif job_variables is None and infra_overrides is not None:
-            values["job_variables"] = infra_overrides
-        return values
+    def __repr__(self):
+        return repr(self.__wrapped__)
 
-    def __setattr__(self, key: str, value: Any) -> None:
-        """
-        Override the default __setattr__ to ensure that setting `infra_overrides` or
-        `job_variables` will update both fields.
-        """
-        if key == "infra_overrides" or key == "job_variables":
-            updates = {"infra_overrides": value, "job_variables": value}
-            self.__dict__.update(updates)
-            return
-        super().__setattr__(key, value)
-
-    def dict(self, **kwargs) -> Dict[str, Any]:
-        """
-        Override the default dict method to ensure only `infra_overrides` is serialized.
-        This preserves backwards compatibility for newer clients talking to older servers.
-        """
-        exclude: Union[set, Dict[str, Any]] = kwargs.pop("exclude", set())
-        exclude_type = type(exclude)
-
-        if exclude_type is set:
-            exclude.add("job_variables")
-        elif exclude_type is dict:
-            exclude["job_variables"] = True
-        else:
-            exclude = {"job_variables"}
-        kwargs["exclude"] = exclude
-
-        return super().dict(**kwargs)
-
-    @classmethod
-    def schema(
-        cls, by_alias: bool = True, ref_template: str = default_ref_template
-    ) -> Dict[str, Any]:
-        """
-        Don't use the mixin docstring as the description if this class is missing a
-        docstring.
-        """
-        schema = super().schema(by_alias=by_alias, ref_template=ref_template)
-
-        if not cls.__doc__:
-            schema.pop("description", None)
-
-        return schema
-
-
-def handle_deprecated_infra_overrides_parameter(
-    job_variables: Dict[str, Any], infra_overrides: Dict[str, Any]
-) -> Optional[Dict[str, Any]]:
-    if infra_overrides is not None and job_variables is not None:
-        raise RuntimeError(
-            "The `infra_overrides` argument has been renamed to `job_variables`."
-            "Use one or the other, but not both."
+    def __reduce_ex__(self, protocol):
+        return (
+            type(self),
+            (self.__wrapped__,),
+            {"_self_already_awaited": self._self_already_awaited},
         )
-    elif infra_overrides is not None and job_variables is None:
-        jv = infra_overrides
-    elif job_variables is not None and infra_overrides is None:
-        jv = job_variables
-    else:
-        jv = None
-    return jv
+
+
+def deprecated_async_method(wrapped):
+    """Decorator that wraps a sync method to allow awaiting it even though it is no longer async."""
+
+    @wrapt.decorator
+    def wrapper(wrapped, instance, args, kwargs):
+        result = wrapped(*args, **kwargs)
+        return AsyncCompatProxy(
+            result, class_name=instance.__class__.__name__, method_name=wrapped.__name__
+        )
+
+    return wrapper(wrapped)

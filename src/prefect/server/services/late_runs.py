@@ -5,6 +5,7 @@ The threshold for a late run can be configured by changing `PREFECT_API_SERVICES
 
 import asyncio
 import datetime
+from typing import Optional
 
 import pendulum
 import sqlalchemy as sa
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import prefect.server.models as models
 from prefect.server.database.dependencies import inject_db
 from prefect.server.database.interface import PrefectDBInterface
+from prefect.server.exceptions import ObjectNotFoundError
 from prefect.server.orchestration.core_policy import MarkLateRunsPolicy
 from prefect.server.schemas import states
 from prefect.server.services.loop_service import LoopService
@@ -31,7 +33,7 @@ class MarkLateRuns(LoopService):
     Prefect REST API Settings.
     """
 
-    def __init__(self, loop_seconds: float = None, **kwargs):
+    def __init__(self, loop_seconds: Optional[float] = None, **kwargs):
         super().__init__(
             loop_seconds=loop_seconds
             or PREFECT_API_SERVICES_LATE_RUNS_LOOP_SECONDS.value(),
@@ -112,13 +114,16 @@ class MarkLateRuns(LoopService):
 
         Pass-through method for overrides.
         """
-        await models.flow_runs.set_flow_run_state(
-            session=session,
-            flow_run_id=flow_run.id,
-            state=states.Late(scheduled_time=flow_run.next_scheduled_start_time),
-            flow_policy=MarkLateRunsPolicy,  # type: ignore
-        )
+        try:
+            await models.flow_runs.set_flow_run_state(
+                session=session,
+                flow_run_id=flow_run.id,
+                state=states.Late(scheduled_time=flow_run.next_scheduled_start_time),
+                flow_policy=MarkLateRunsPolicy,  # type: ignore
+            )
+        except ObjectNotFoundError:
+            return  # flow run was deleted, ignore it
 
 
 if __name__ == "__main__":
-    asyncio.run(MarkLateRuns().start())
+    asyncio.run(MarkLateRuns(handle_signals=True).start())

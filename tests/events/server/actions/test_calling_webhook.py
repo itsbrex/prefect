@@ -6,18 +6,11 @@ from uuid import UUID, uuid4
 
 import orjson
 import pendulum
-import pydantic
 import pytest
 from httpx import Response
 from pendulum.datetime import DateTime
+from pydantic import TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from prefect._internal.pydantic import HAS_PYDANTIC_V2
-
-if HAS_PYDANTIC_V2:
-    import pydantic.v1 as pydantic
-else:
-    import pydantic
 
 from prefect.blocks.core import Block
 from prefect.blocks.webhook import Webhook
@@ -78,7 +71,6 @@ async def take_a_picture_deployment(
         session=session,
         deployment=Deployment(
             name="Take a picture on demand",
-            manifest_path="file.json",
             flow_id=take_a_picture.flow_id,
             is_schedule_active=True,
             paused=False,
@@ -369,14 +361,14 @@ async def test_success_event(
 
     assert event.event == "prefect.automation.action.executed"
     assert event.related == [
-        RelatedResource.parse_obj(
+        RelatedResource.model_validate(
             {
                 "prefect.resource.id": f"prefect.block-document.{webhook_block_id}",
                 "prefect.resource.role": "block",
                 "prefect.resource.name": "webhook-test",
             }
         ),
-        RelatedResource.parse_obj(
+        RelatedResource.model_validate(
             {
                 "prefect.resource.id": "prefect.block-type.webhook",
                 "prefect.resource.role": "block-type",
@@ -407,9 +399,10 @@ async def test_migrating_to_templates():
     assert isinstance(action.payload, str)
     assert action.payload == '{\n  "message": "hello world"\n}'
 
+    actions_adapter = TypeAdapter(actions.ActionTypes)
+
     # The form it will be when read from the database
-    action = pydantic.parse_obj_as(
-        actions.ActionTypes,
+    action = actions_adapter.validate_python(
         {
             "type": "call-webhook",
             "block_document_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
@@ -421,8 +414,7 @@ async def test_migrating_to_templates():
     assert action.payload == '{\n  "message": "hello world"\n}'
 
     # The form it will be when read from an API body
-    action = pydantic.parse_raw_as(
-        actions.ActionTypes,
+    action = actions_adapter.validate_json(
         """
         {
             "type" : "call-webhook",

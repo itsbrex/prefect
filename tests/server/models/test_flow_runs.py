@@ -17,18 +17,6 @@ class TestCreateFlowRun:
         )
         assert flow_run.flow_id == flow.id
 
-    async def test_create_flow_run_with_infrastructure(
-        self, flow, session, infrastructure_document_id
-    ):
-        flow_run = await models.flow_runs.create_flow_run(
-            session=session,
-            flow_run=schemas.core.FlowRun(
-                flow_id=flow.id,
-                infrastructure_document_id=infrastructure_document_id,
-            ),
-        )
-        assert flow_run.infrastructure_document_id == infrastructure_document_id
-
     async def test_create_flow_run_has_no_default_state(self, flow, session):
         flow_run = await models.flow_runs.create_flow_run(
             session=session,
@@ -181,7 +169,6 @@ class TestCreateFlowRun:
             deployment=schemas.core.Deployment(
                 name="",
                 flow_id=flow.id,
-                manifest_path="file.json",
             ),
         )
         flow_run = await models.flow_runs.create_flow_run(
@@ -807,7 +794,6 @@ class TestReadFlowRuns:
             deployment=schemas.core.Deployment(
                 name="",
                 flow_id=flow.id,
-                manifest_path="file.json",
             ),
         )
         flow_run_1 = await models.flow_runs.create_flow_run(

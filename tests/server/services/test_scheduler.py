@@ -4,7 +4,6 @@ import pendulum
 import pytest
 import sqlalchemy as sa
 
-from prefect import states
 from prefect.server import models, schemas
 from prefect.server.services.scheduler import RecentDeploymentsScheduler, Scheduler
 from prefect.settings import (
@@ -110,7 +109,7 @@ async def test_create_schedules_from_deployment(
     n_runs = await models.flow_runs.count_flow_runs(session)
     assert n_runs == 0
 
-    service = Scheduler(handle_signals=False)
+    service = Scheduler()
     await service.start(loops=1)
     runs = await models.flow_runs.read_flow_runs(session)
     assert len(runs) == service.min_runs * num_active_schedules
@@ -147,7 +146,7 @@ async def test_create_schedule_respects_max_future_time(flow, session):
 
     n_runs = await models.flow_runs.count_flow_runs(session)
     assert n_runs == 0
-    service = Scheduler(handle_signals=False)
+    service = Scheduler()
     await service.start(loops=1)
     runs = await models.flow_runs.read_flow_runs(session)
 
@@ -211,7 +210,7 @@ async def test_create_schedules_from_multiple_deployments(flow, session):
     n_runs = await models.flow_runs.count_flow_runs(session)
     assert n_runs == 0
 
-    service = Scheduler(handle_signals=False)
+    service = Scheduler()
     await service.start(loops=1)
     runs = await models.flow_runs.read_flow_runs(session)
 
@@ -259,7 +258,7 @@ async def test_create_schedules_from_multiple_deployments_in_batches(flow, sessi
     assert n_runs == 0
 
     # should insert more than the batch size successfully
-    await Scheduler(handle_signals=False).start(loops=1)
+    await Scheduler().start(loops=1)
     runs = await models.flow_runs.read_flow_runs(session)
     assert (
         len(runs)
@@ -293,7 +292,7 @@ async def test_scheduler_respects_paused(flow, session):
     n_runs = await models.flow_runs.count_flow_runs(session)
     assert n_runs == 0
 
-    await Scheduler(handle_signals=False).start(loops=1)
+    await Scheduler().start(loops=1)
     n_runs_2 = await models.flow_runs.count_flow_runs(session)
     assert n_runs_2 == 0
 
@@ -325,8 +324,8 @@ async def test_scheduler_runs_when_too_few_scheduled_runs_but_doesnt_overwrite(
     assert n_runs == 0
 
     # run multiple loops
-    await Scheduler(handle_signals=False).start(loops=1)
-    await Scheduler(handle_signals=False).start(loops=1)
+    await Scheduler().start(loops=1)
+    await Scheduler().start(loops=1)
 
     n_runs = await models.flow_runs.count_flow_runs(session)
     assert n_runs == 3
@@ -341,12 +340,12 @@ async def test_scheduler_runs_when_too_few_scheduled_runs_but_doesnt_overwrite(
 
     # cancel one run
     await models.flow_runs.set_flow_run_state(
-        session, runs[0].id, state=states.Cancelled()
+        session, runs[0].id, state=schemas.states.Cancelled()
     )
     await session.commit()
 
     # run scheduler again
-    await Scheduler(handle_signals=False).start(loops=1)
+    await Scheduler().start(loops=1)
     runs = await models.flow_runs.read_flow_runs(
         session,
         flow_run_filter=schemas.filters.FlowRunFilter(
@@ -375,12 +374,12 @@ async def test_only_looks_at_deployments_with_active_schedules(
 
 class TestRecentDeploymentsScheduler:
     async def test_tight_loop_by_default(self):
-        assert RecentDeploymentsScheduler(handle_signals=False).loop_seconds == 5
+        assert RecentDeploymentsScheduler().loop_seconds == 5
 
     async def test_schedules_runs_for_recently_created_deployments(
         self, deployment, session, db
     ):
-        recent_scheduler = RecentDeploymentsScheduler(handle_signals=False)
+        recent_scheduler = RecentDeploymentsScheduler()
         count_query = (
             sa.select(sa.func.count())
             .select_from(db.FlowRun)
@@ -411,7 +410,7 @@ class TestRecentDeploymentsScheduler:
             .where(db.FlowRun.deployment_id == deployment.id)
         )
 
-        recent_scheduler = RecentDeploymentsScheduler(handle_signals=False)
+        recent_scheduler = RecentDeploymentsScheduler()
         runs_count = (await session.execute(count_query)).scalar()
         assert runs_count == 0
 
@@ -437,7 +436,7 @@ class TestRecentDeploymentsScheduler:
             .where(db.FlowRun.deployment_id == deployment.id)
         )
 
-        recent_scheduler = RecentDeploymentsScheduler(handle_signals=False)
+        recent_scheduler = RecentDeploymentsScheduler()
         runs_count = (await session.execute(count_query)).scalar()
         assert runs_count == 0
 
@@ -457,7 +456,7 @@ class TestRecentDeploymentsScheduler:
         assert n_runs == 0
 
         query = (
-            RecentDeploymentsScheduler(handle_signals=False)
+            RecentDeploymentsScheduler()
             ._get_select_deployments_to_schedule_query()
             .limit(10)
         )
@@ -506,7 +505,7 @@ class TestScheduleRulesWaterfall:
         assert (await models.flow_runs.count_flow_runs(session)) == 0
 
         # run scheduler
-        service = Scheduler(handle_signals=False)
+        service = Scheduler()
         await service.start(loops=1)
 
         runs = await models.flow_runs.read_flow_runs(session)

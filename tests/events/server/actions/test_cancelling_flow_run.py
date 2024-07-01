@@ -36,14 +36,13 @@ async def take_a_picture(
         session=session,
         deployment=Deployment(
             name="Take a picture on demand",
-            manifest_path="file.json",
             flow_id=snap_a_pic.id,
             is_schedule_active=True,
             paused=False,
         ),
     )
     await session.commit()
-    return Deployment.from_orm(deployment)
+    return Deployment.model_validate(deployment, from_attributes=True)
 
 
 @pytest.fixture
@@ -60,7 +59,7 @@ async def super_long_exposure(
         ),
     )
     await session.commit()
-    return FlowRun.from_orm(super_long_exposure)
+    return FlowRun.model_validate(super_long_exposure, from_attributes=True)
 
 
 @pytest.fixture
@@ -222,7 +221,7 @@ async def test_success_event(
 
     assert event.event == "prefect.automation.action.executed"
     assert event.related == [
-        RelatedResource.parse_obj(
+        RelatedResource.model_validate(
             {
                 "prefect.resource.id": f"prefect.flow-run.{super_long_exposure.id}",
                 "prefect.resource.role": "target",

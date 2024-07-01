@@ -1,14 +1,17 @@
-from datetime import timedelta
+from datetime import timedelta, timezone
 from unittest import mock
 from uuid import UUID
 
 import pendulum
+from pydantic_extra_types.pendulum_dt import DateTime
 
 from prefect.events import emit_event
-from prefect.events.clients import AssertingEventsClient, NullEventsClient
+from prefect.events.clients import AssertingEventsClient
 from prefect.events.worker import EventsWorker
-from prefect.server.utilities.schemas import DateTimeTZ
-from prefect.settings import PREFECT_API_URL, temporary_settings
+from prefect.settings import (
+    PREFECT_API_URL,
+    temporary_settings,
+)
 
 
 def test_emits_simple_event(asserting_events_worker: EventsWorker, reset_worker_events):
@@ -32,7 +35,7 @@ def test_emits_complex_event(
     emit_event(
         event="vogon.poetry.read",
         resource={"prefect.resource.id": "vogon.poem.oh-freddled-gruntbuggly"},
-        occurred=DateTimeTZ(2023, 3, 1, 12, 39, 28),
+        occurred=DateTime(2023, 3, 1, 12, 39, 28),
         related=[
             {
                 "prefect.resource.id": "vogon.ship.the-business-end",
@@ -50,7 +53,7 @@ def test_emits_complex_event(
     event = asserting_events_worker._client.events[0]
     assert event.event == "vogon.poetry.read"
     assert event.resource.id == "vogon.poem.oh-freddled-gruntbuggly"
-    assert event.occurred == DateTimeTZ(2023, 3, 1, 12, 39, 28)
+    assert event.occurred == DateTime(2023, 3, 1, 12, 39, 28, tzinfo=timezone.utc)
     assert len(event.related) == 1
     assert event.related[0].id == "vogon.ship.the-business-end"
     assert event.related[0].role == "locale"
@@ -77,12 +80,14 @@ def test_sets_follows_tight_timing(
         event="planet.destroyed",
         resource={"prefect.resource.id": "milky-way.sol.earth"},
     )
+    assert destroyed_event
 
     read_event = emit_event(
         event="vogon.poetry.read",
         resource={"prefect.resource.id": "vogon.poem.oh-freddled-gruntbuggly"},
         follows=destroyed_event,
     )
+    assert read_event
 
     asserting_events_worker.drain()
     assert read_event.follows == destroyed_event.id
@@ -96,6 +101,7 @@ def test_does_not_set_follows_not_tight_timing(
         occurred=pendulum.now("UTC") - timedelta(minutes=10),
         resource={"prefect.resource.id": "milky-way.sol.earth"},
     )
+    assert destroyed_event
 
     # These events are more than 5m apart so the `follows` property of the
     # emitted event shouldn't be set.
@@ -104,23 +110,10 @@ def test_does_not_set_follows_not_tight_timing(
         resource={"prefect.resource.id": "vogon.poem.oh-freddled-gruntbuggly"},
         follows=destroyed_event,
     )
+    assert read_event
 
     asserting_events_worker.drain()
     assert read_event.follows is None
-
-
-def test_noop_with_null_events_client():
-    with temporary_settings(updates={PREFECT_API_URL: None}):
-        worker = EventsWorker.instance()
-        assert worker.client_type == NullEventsClient
-
-        assert (
-            emit_event(
-                event="vogon.poetry.read",
-                resource={"prefect.resource.id": "vogon.poem.oh-freddled-gruntbuggly"},
-            )
-            is None
-        )
 
 
 def test_noop_with_non_cloud_client(mock_should_emit_events: mock.Mock):

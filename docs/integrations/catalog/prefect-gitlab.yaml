@@ -1,6 +1,6 @@
-collectionName: prefect-gitlab
+integrationName: prefect-gitlab
 author: Prefect
 authorUrl: https://prefect.io
-documentation: https://prefecthq.github.io/prefect-gitlab/
-iconUrl: /img/collections/gitlab.png
+documentation: prefect-gitlab
+iconUrl: /images/integrations/gitlab.png
 tag: GitLab

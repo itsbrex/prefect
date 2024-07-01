@@ -42,6 +42,7 @@ dependent on the value of other settings or perform other dynamic effects.
 
 import logging
 import os
+import re
 import string
 import warnings
 from contextlib import contextmanager
@@ -65,36 +66,22 @@ from typing import (
 )
 from urllib.parse import urlparse
 
+import pydantic
 import toml
-
-from prefect._internal.pydantic import HAS_PYDANTIC_V2
-from prefect._internal.schemas.validators import validate_settings
-
-if HAS_PYDANTIC_V2:
-    from pydantic.v1 import (
-        BaseModel,
-        BaseSettings,
-        Field,
-        create_model,
-        fields,
-        root_validator,
-        validator,
-    )
-else:
-    from pydantic import (
-        BaseModel,
-        BaseSettings,
-        Field,
-        create_model,
-        fields,
-        root_validator,
-        validator,
-    )
-
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    create_model,
+    field_validator,
+    fields,
+    model_validator,
+)
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing_extensions import Literal
 
 from prefect._internal.compatibility.deprecated import generate_deprecation_message
-from prefect._internal.pydantic import HAS_PYDANTIC_V2
+from prefect._internal.schemas.validators import validate_settings
 from prefect.exceptions import MissingProfileError
 from prefect.utilities.names import OBFUSCATED_PREFIX, obfuscate
 from prefect.utilities.pydantic import add_cloudpickle_reduction
@@ -103,15 +90,6 @@ T = TypeVar("T")
 
 
 DEFAULT_PROFILES_PATH = Path(__file__).parent.joinpath("profiles.toml")
-
-REMOVED_EXPERIMENTAL_FLAGS = {
-    "PREFECT_EXPERIMENTAL_ENABLE_ENHANCED_SCHEDULING_UI",
-    "PREFECT_EXPERIMENTAL_ENABLE_ENHANCED_DEPLOYMENT_PARAMETERS",
-    "PREFECT_EXPERIMENTAL_ENABLE_EVENTS_CLIENT",
-    "PREFECT_EXPERIMENTAL_WARN_EVENTS_CLIENT",
-    "PREFECT_EXPERIMENTAL_ENABLE_FLOW_RUN_INFRA_OVERRIDES",
-    "PREFECT_EXPERIMENTAL_WARN_FLOW_RUN_INFRA_OVERRIDES",
-}
 
 
 class Setting(Generic[T]):
@@ -245,7 +223,7 @@ class Setting(Generic[T]):
         )
 
     def __repr__(self) -> str:
-        return f"<{self.name}: {self.type.__name__}>"
+        return f"<{self.name}: {self.type!r}>"
 
     def __bool__(self) -> bool:
         """
@@ -386,21 +364,6 @@ def warn_on_database_password_value_without_usage(values):
     return values
 
 
-def check_for_deprecated_cloud_url(settings, value):
-    deprecated_value = PREFECT_CLOUD_URL.value_from(settings, bypass_callback=True)
-    if deprecated_value is not None:
-        warnings.warn(
-            (
-                "`PREFECT_CLOUD_URL` is set and will be used instead of"
-                " `PREFECT_CLOUD_API_URL` for backwards compatibility."
-                " `PREFECT_CLOUD_URL` is deprecated, set `PREFECT_CLOUD_API_URL`"
-                " instead."
-            ),
-            DeprecationWarning,
-        )
-    return deprecated_value or value
-
-
 def warn_on_misconfigured_api_url(values):
     """
     Validator for settings warning if the API URL is misconfigured.
@@ -498,10 +461,8 @@ def default_cloud_ui_url(settings, value):
     # Otherwise, infer a value from the API URL
     ui_url = api_url = PREFECT_CLOUD_API_URL.value_from(settings)
 
-    if api_url.startswith("https://api.prefect.cloud"):
-        ui_url = ui_url.replace(
-            "https://api.prefect.cloud", "https://app.prefect.cloud", 1
-        )
+    if re.match(r"^https://api[\.\w]*.prefect.[^\.]+/", api_url):
+        ui_url = ui_url.replace("https://api", "https://app", 1)
 
     if ui_url.endswith("/api"):
         ui_url = ui_url[:-4]
@@ -610,7 +571,7 @@ This is recommended only during development, e.g. when using self-signed certifi
 """
 
 PREFECT_API_SSL_CERT_FILE = Setting(
-    str,
+    Optional[str],
     default=os.environ.get("SSL_CERT_FILE"),
 )
 """
@@ -620,7 +581,7 @@ If left unset, the setting will default to the value provided by the `SSL_CERT_F
 """
 
 PREFECT_API_URL = Setting(
-    str,
+    Optional[str],
     default=None,
 )
 """
@@ -639,7 +600,7 @@ we would like to silence this warning so we will set it to `FALSE`.
 """
 
 PREFECT_API_KEY = Setting(
-    str,
+    Optional[str],
     default=None,
     is_secret=True,
 )
@@ -702,21 +663,9 @@ Defaults to `True`, ensuring CSRF protection is enabled by default.
 PREFECT_CLOUD_API_URL = Setting(
     str,
     default="https://api.prefect.cloud/api",
-    value_callback=check_for_deprecated_cloud_url,
 )
 """API URL for Prefect Cloud. Used for authentication."""
 
-
-PREFECT_CLOUD_URL = Setting(
-    str,
-    default=None,
-    deprecated=True,
-    deprecated_start_date="Dec 2022",
-    deprecated_help="Use `PREFECT_CLOUD_API_URL` instead.",
-)
-"""
-DEPRECATED: Use `PREFECT_CLOUD_API_URL` instead.
-"""
 
 PREFECT_UI_URL = Setting(
     Optional[str],
@@ -732,7 +681,7 @@ When using an ephemeral server, this will be `None`.
 
 
 PREFECT_CLOUD_UI_URL = Setting(
-    str,
+    Optional[str],
     default=None,
     value_callback=default_cloud_ui_url,
 )
@@ -946,7 +895,7 @@ The following options are available:
 """
 
 PREFECT_SQLALCHEMY_POOL_SIZE = Setting(
-    int,
+    Optional[int],
     default=None,
 )
 """
@@ -954,7 +903,7 @@ Controls connection pool size when using a PostgreSQL database with the Prefect 
 """
 
 PREFECT_SQLALCHEMY_MAX_OVERFLOW = Setting(
-    int,
+    Optional[int],
     default=None,
 )
 """
@@ -978,41 +927,6 @@ This allows styles to be conveniently added to log messages, e.g.
 if enabled, strings that contain square brackets may be inaccurately
 interpreted and lead to incomplete output, e.g.
 `DROP TABLE [dbo].[SomeTable];"` outputs `DROP TABLE .[SomeTable];`.
-"""
-
-PREFECT_TASK_INTROSPECTION_WARN_THRESHOLD = Setting(
-    float,
-    default=10.0,
-)
-"""
-Threshold time in seconds for logging a warning if task parameter introspection
-exceeds this duration. Parameter introspection can be a significant performance hit
-when the parameter is a large collection object, e.g. a large dictionary or DataFrame,
-and each element needs to be inspected. See `prefect.utilities.annotations.quote`
-for more details.
-Defaults to `10.0`.
-Set to `0` to disable logging the warning.
-"""
-
-PREFECT_AGENT_QUERY_INTERVAL = Setting(
-    float,
-    default=15,
-)
-"""
-The agent loop interval, in seconds. Agents will check for new runs this often.
-Defaults to `15`.
-"""
-
-PREFECT_AGENT_PREFETCH_SECONDS = Setting(
-    int,
-    default=15,
-)
-"""
-Agents will look for scheduled runs this many seconds in
-the future and attempt to run them. This accounts for any additional
-infrastructure spin-up time or latency in preparing a flow run. Note
-flow runs will not start before their scheduled time, even if they are
-prefetched. Defaults to `15`.
 """
 
 PREFECT_ASYNC_FETCH_STATE_RESULT = Setting(bool, default=False)
@@ -1040,7 +954,7 @@ registered.
 """
 
 PREFECT_API_DATABASE_PASSWORD = Setting(
-    str,
+    Optional[str],
     default=None,
     is_secret=True,
 )
@@ -1051,7 +965,7 @@ To use this setting, you must include it in your connection URL.
 """
 
 PREFECT_API_DATABASE_CONNECTION_URL = Setting(
-    str,
+    Optional[str],
     default=None,
     value_callback=default_database_connection_url,
     is_secret=True,
@@ -1214,6 +1128,39 @@ PREFECT_API_SERVICES_CANCELLATION_CLEANUP_LOOP_SECONDS = Setting(
 this often. Defaults to `20`.
 """
 
+PREFECT_API_SERVICES_FOREMAN_ENABLED = Setting(bool, default=True)
+"""Whether or not to start the Foreman service in the server application."""
+
+PREFECT_API_SERVICES_FOREMAN_LOOP_SECONDS = Setting(float, default=15)
+"""The number of seconds to wait between each iteration of the Foreman loop which checks
+for offline workers and updates work pool status."""
+
+
+PREFECT_API_SERVICES_FOREMAN_INACTIVITY_HEARTBEAT_MULTIPLE = Setting(int, default=3)
+"The number of heartbeats that must be missed before a worker is marked as offline."
+
+PREFECT_API_SERVICES_FOREMAN_FALLBACK_HEARTBEAT_INTERVAL_SECONDS = Setting(
+    int, default=30
+)
+"""The number of seconds to use for online/offline evaluation if a worker's heartbeat
+interval is not set."""
+
+PREFECT_API_SERVICES_FOREMAN_DEPLOYMENT_LAST_POLLED_TIMEOUT_SECONDS = Setting(
+    int, default=60
+)
+"""The number of seconds before a deployment is marked as not ready if it has not been
+polled."""
+
+PREFECT_API_SERVICES_FOREMAN_WORK_QUEUE_LAST_POLLED_TIMEOUT_SECONDS = Setting(
+    int, default=60
+)
+"""The number of seconds before a work queue is marked as not ready if it has not been
+polled."""
+
+PREFECT_API_LOG_RETRYABLE_ERRORS = Setting(bool, default=False)
+"""If `True`, log retryable errors in the API and it's services."""
+
+
 PREFECT_API_DEFAULT_LIMIT = Setting(
     int,
     default=200,
@@ -1283,7 +1230,7 @@ PREFECT_UI_ENABLED = Setting(
 """Whether or not to serve the Prefect UI."""
 
 PREFECT_UI_API_URL = Setting(
-    str,
+    Optional[str],
     default=None,
     value_callback=default_ui_api_url,
 )
@@ -1361,40 +1308,6 @@ PREFECT_API_MAX_FLOW_RUN_GRAPH_ARTIFACTS = Setting(int, default=10000)
 The maximum number of artifacts to show on a flow run graph on the v2 API
 """
 
-PREFECT_EXPERIMENTAL_ENABLE_ARTIFACTS_ON_FLOW_RUN_GRAPH = Setting(bool, default=True)
-"""
-Whether or not to enable artifacts on the flow run graph.
-"""
-
-PREFECT_EXPERIMENTAL_ENABLE_STATES_ON_FLOW_RUN_GRAPH = Setting(bool, default=True)
-"""
-Whether or not to enable flow run states on the flow run graph.
-"""
-
-PREFECT_EXPERIMENTAL_ENABLE_WORK_POOLS = Setting(bool, default=True)
-"""
-Whether or not to enable experimental Prefect work pools.
-"""
-
-PREFECT_EXPERIMENTAL_WARN_WORK_POOLS = Setting(bool, default=False)
-"""
-Whether or not to warn when experimental Prefect work pools are used.
-"""
-
-PREFECT_EXPERIMENTAL_ENABLE_WORKERS = Setting(bool, default=True)
-"""
-Whether or not to enable experimental Prefect workers.
-"""
-
-PREFECT_EXPERIMENTAL_WARN_WORKERS = Setting(bool, default=False)
-"""
-Whether or not to warn when experimental Prefect workers are used.
-"""
-
-PREFECT_EXPERIMENTAL_WARN_VISUALIZE = Setting(bool, default=False)
-"""
-Whether or not to warn when experimental Prefect visualize is used.
-"""
 
 PREFECT_EXPERIMENTAL_ENABLE_ENHANCED_CANCELLATION = Setting(bool, default=True)
 """
@@ -1406,35 +1319,8 @@ PREFECT_EXPERIMENTAL_WARN_ENHANCED_CANCELLATION = Setting(bool, default=False)
 Whether or not to warn when experimental enhanced flow run cancellation is used.
 """
 
-PREFECT_EXPERIMENTAL_ENABLE_DEPLOYMENT_STATUS = Setting(bool, default=True)
-"""
-Whether or not to enable deployment status in the UI
-"""
-
-PREFECT_EXPERIMENTAL_WARN_DEPLOYMENT_STATUS = Setting(bool, default=False)
-"""
-Whether or not to warn when deployment status is used.
-"""
-
-PREFECT_EXPERIMENTAL_FLOW_RUN_INPUT = Setting(bool, default=False)
-"""
-Whether or not to enable flow run input.
-"""
-
-PREFECT_EXPERIMENTAL_WARN_FLOW_RUN_INPUT = Setting(bool, default=True)
-"""
-Whether or not to enable flow run input.
-"""
-
 
 # Prefect Events feature flags
-
-PREFECT_EXPERIMENTAL_EVENTS = Setting(bool, default=False)
-"""
-Whether to enable Prefect's server-side event features. Note that Prefect Cloud clients
-will always emit events during flow and task runs regardless of this setting.
-"""
-
 
 PREFECT_RUNNER_PROCESS_LIMIT = Setting(int, default=5)
 """
@@ -1471,6 +1357,11 @@ PREFECT_RUNNER_SERVER_ENABLE = Setting(bool, default=False)
 Whether or not to enable the runner's webserver.
 """
 
+PREFECT_DEPLOYMENT_SCHEDULE_MAX_SCHEDULED_RUNS = Setting(int, default=50)
+"""
+The maximum number of scheduled runs to create for a deployment.
+"""
+
 PREFECT_WORKER_HEARTBEAT_SECONDS = Setting(float, default=30)
 """
 Number of seconds a worker should wait between sending a heartbeat.
@@ -1503,10 +1394,12 @@ PREFECT_WORKER_WEBSERVER_PORT = Setting(
 The port the worker's webserver should bind to.
 """
 
-PREFECT_TASK_SCHEDULING_DEFAULT_STORAGE_BLOCK = Setting(
-    str,
-    default="local-file-system/prefect-task-scheduling",
-)
+PREFECT_API_SERVICES_TASK_SCHEDULING_ENABLED = Setting(bool, default=True)
+"""
+Whether or not to start the task scheduling service in the server application.
+"""
+
+PREFECT_TASK_SCHEDULING_DEFAULT_STORAGE_BLOCK = Setting(Optional[str], default=None)
 """The `block-type/block-document` slug of a block to use as the default storage
 for autonomous tasks."""
 
@@ -1536,12 +1429,12 @@ The maximum number of retries to queue for submission.
 
 PREFECT_TASK_SCHEDULING_PENDING_TASK_TIMEOUT = Setting(
     timedelta,
-    default=timedelta(seconds=30),
+    default=timedelta(0),
 )
 """
-How long before a PENDING task are made available to another task server.  In practice,
-a task server should move a task from PENDING to RUNNING very quickly, so runs stuck in
-PENDING for a while is a sign that the task server may have crashed.
+How long before a PENDING task are made available to another task worker.  In practice,
+a task worker should move a task from PENDING to RUNNING very quickly, so runs stuck in
+PENDING for a while is a sign that the task worker may have crashed.
 """
 
 PREFECT_EXPERIMENTAL_ENABLE_EXTRA_RUNNER_ENDPOINTS = Setting(bool, default=False)
@@ -1549,52 +1442,28 @@ PREFECT_EXPERIMENTAL_ENABLE_EXTRA_RUNNER_ENDPOINTS = Setting(bool, default=False
 Whether or not to enable experimental worker webserver endpoints.
 """
 
-PREFECT_EXPERIMENTAL_ENABLE_ARTIFACTS = Setting(bool, default=True)
+PREFECT_EXPERIMENTAL_DISABLE_SYNC_COMPAT = Setting(bool, default=False)
 """
-Whether or not to enable experimental Prefect artifacts.
-"""
-
-PREFECT_EXPERIMENTAL_WARN_ARTIFACTS = Setting(bool, default=False)
-"""
-Whether or not to warn when experimental Prefect artifacts are used.
+Whether or not to disable the sync_compatible decorator utility.
 """
 
-PREFECT_EXPERIMENTAL_ENABLE_WORKSPACE_DASHBOARD = Setting(bool, default=True)
-"""
-Whether or not to enable the experimental workspace dashboard.
-"""
-
-PREFECT_EXPERIMENTAL_WARN_WORKSPACE_DASHBOARD = Setting(bool, default=False)
-"""
-Whether or not to warn when the experimental workspace dashboard is enabled.
-"""
-
-PREFECT_EXPERIMENTAL_ENABLE_TASK_SCHEDULING = Setting(bool, default=False)
-"""
-Whether or not to enable experimental task scheduling.
-"""
-
-PREFECT_EXPERIMENTAL_ENABLE_WORK_QUEUE_STATUS = Setting(bool, default=True)
-"""
-Whether or not to enable experimental work queue status in-place of work queue health.
-"""
-
+PREFECT_EXPERIMENTAL_ENABLE_SCHEDULE_CONCURRENCY = Setting(bool, default=False)
 
 # Defaults -----------------------------------------------------------------------------
 
 PREFECT_DEFAULT_RESULT_STORAGE_BLOCK = Setting(
-    str,
+    Optional[str],
     default=None,
 )
 """The `block-type/block-document` slug of a block to use as the default result storage."""
 
-PREFECT_DEFAULT_WORK_POOL_NAME = Setting(str, default=None)
+PREFECT_DEFAULT_WORK_POOL_NAME = Setting(Optional[str], default=None)
 """
 The default work pool to deploy to.
 """
 
 PREFECT_DEFAULT_DOCKER_BUILD_NAMESPACE = Setting(
-    str,
+    Optional[str],
     default=None,
 )
 """
@@ -1614,7 +1483,7 @@ Defaults to the root path.
 """
 
 PREFECT_UI_STATIC_DIRECTORY = Setting(
-    str,
+    Optional[str],
     default=None,
 )
 """
@@ -1658,11 +1527,6 @@ PREFECT_EVENTS_MAXIMUM_SIZE_BYTES = Setting(int, default=1_500_000)
 The maximum size of an Event when serialized to JSON
 """
 
-PREFECT_API_SERVICES_EVENT_LOGGER_ENABLED = Setting(bool, default=True)
-"""
-Whether or not to start the event debug logger service in the server application.
-"""
-
 PREFECT_API_SERVICES_TRIGGERS_ENABLED = Setting(bool, default=True)
 """
 Whether or not to start the triggers service in the server application.
@@ -1693,10 +1557,35 @@ PREFECT_API_SERVICES_EVENT_PERSISTER_FLUSH_INTERVAL = Setting(float, default=5, 
 The maximum number of seconds between flushes of the event persister.
 """
 
+PREFECT_EVENTS_RETENTION_PERIOD = Setting(timedelta, default=timedelta(days=7))
+"""
+The amount of time to retain events in the database.
+"""
+
 PREFECT_API_EVENTS_STREAM_OUT_ENABLED = Setting(bool, default=True)
 """
 Whether or not to allow streaming events out of via websockets.
 """
+
+PREFECT_API_EVENTS_RELATED_RESOURCE_CACHE_TTL = Setting(
+    timedelta, default=timedelta(minutes=5)
+)
+"""
+How long to cache related resource data for emitting server-side vents
+"""
+
+PREFECT_EVENTS_MAXIMUM_WEBSOCKET_BACKFILL = Setting(
+    timedelta, default=timedelta(minutes=15)
+)
+"""
+The maximum range to look back for backfilling events for a websocket subscriber
+"""
+
+PREFECT_EVENTS_WEBSOCKET_BACKFILL_PAGE_SIZE = Setting(int, default=250, gt=0)
+"""
+The page size for the queries to backfill events for websocket subscribers
+"""
+
 
 # Deprecated settings ------------------------------------------------------------------
 
@@ -1715,10 +1604,14 @@ for __name, __setting in SETTING_VARIABLES.items():
 
 # Dynamically create a pydantic model that includes all of our settings
 
-SettingsFieldsMixin = create_model(
+
+class PrefectBaseSettings(BaseSettings):
+    model_config = SettingsConfigDict(extra="ignore")
+
+
+SettingsFieldsMixin: Type[BaseSettings] = create_model(
     "SettingsFieldsMixin",
-    # Inheriting from `BaseSettings` provides environment variable loading
-    __base__=BaseSettings,
+    __base__=PrefectBaseSettings,  # Inheriting from `BaseSettings` provides environment variable loading
     **{
         setting.name: (setting.type, setting.field)
         for setting in SETTING_VARIABLES.values()
@@ -1760,32 +1653,33 @@ class Settings(SettingsFieldsMixin):
             value = setting.value_callback(self, value)
         return value
 
-    @validator(PREFECT_LOGGING_LEVEL.name, PREFECT_LOGGING_SERVER_LEVEL.name)
+    @field_validator(PREFECT_LOGGING_LEVEL.name, PREFECT_LOGGING_SERVER_LEVEL.name)
     def check_valid_log_level(cls, value):
         if isinstance(value, str):
             value = value.upper()
         logging._checkLevel(value)
         return value
 
-    @root_validator
-    def post_root_validators(cls, values):
+    @model_validator(mode="after")
+    def emit_warnings(self):
         """
         Add root validation functions for settings here.
         """
         # TODO: We could probably register these dynamically but this is the simpler
         #       approach for now. We can explore more interesting validation features
         #       in the future.
+        values = self.model_dump()
         values = max_log_size_smaller_than_batch_size(values)
         values = warn_on_database_password_value_without_usage(values)
         if not values["PREFECT_SILENCE_API_URL_MISCONFIGURATION"]:
             values = warn_on_misconfigured_api_url(values)
-        return values
+        return self
 
     def copy_with_update(
         self,
-        updates: Mapping[Setting, Any] = None,
-        set_defaults: Mapping[Setting, Any] = None,
-        restore_defaults: Iterable[Setting] = None,
+        updates: Optional[Mapping[Setting, Any]] = None,
+        set_defaults: Optional[Mapping[Setting, Any]] = None,
+        restore_defaults: Optional[Iterable[Setting]] = None,
     ) -> "Settings":
         """
         Create a new `Settings` object with validation.
@@ -1808,7 +1702,7 @@ class Settings(SettingsFieldsMixin):
         return self.__class__(
             **{
                 **{setting.name: value for setting, value in set_defaults.items()},
-                **self.dict(exclude_unset=True, exclude=restore_defaults_names),
+                **self.model_dump(exclude_unset=True, exclude=restore_defaults_names),
                 **{setting.name: value for setting, value in updates.items()},
             }
         )
@@ -1817,7 +1711,7 @@ class Settings(SettingsFieldsMixin):
         """
         Returns a copy of this settings object with secret setting values obfuscated.
         """
-        settings = self.copy(
+        settings = self.model_copy(
             update={
                 setting.name: obfuscate(self.value_of(setting))
                 for setting in SETTING_VARIABLES.values()
@@ -1828,7 +1722,11 @@ class Settings(SettingsFieldsMixin):
         )
         # Ensure that settings that have not been marked as "set" before are still so
         # after we have updated their value above
-        settings.__fields_set__.intersection_update(self.__fields_set__)
+        with warnings.catch_warnings():
+            warnings.simplefilter(
+                "ignore", category=pydantic.warnings.PydanticDeprecatedSince20
+            )
+            settings.__fields_set__.intersection_update(self.__fields_set__)
         return settings
 
     def hash_key(self) -> str:
@@ -1840,7 +1738,7 @@ class Settings(SettingsFieldsMixin):
         return str(hash(tuple((key, value) for key, value in env_variables.items())))
 
     def to_environment_variables(
-        self, include: Iterable[Setting] = None, exclude_unset: bool = False
+        self, include: Optional[Iterable[Setting]] = None, exclude_unset: bool = False
     ) -> Dict[str, str]:
         """
         Convert the settings object to environment variables.
@@ -1864,7 +1762,7 @@ class Settings(SettingsFieldsMixin):
             set_keys = {
                 # Collect all of the "set" keys and cast to `Setting` objects
                 SETTING_VARIABLES[key]
-                for key in self.dict(exclude_unset=True)
+                for key in self.model_dump(exclude_unset=True)
             }
             include.intersection_update(set_keys)
 
@@ -1875,23 +1773,19 @@ class Settings(SettingsFieldsMixin):
                     "Invalid type {type(key).__name__!r} for key in `include`."
                 )
 
-        env = {
-            # Use `getattr` instead of `value_of` to avoid value callback resolution
-            key: getattr(self, key)
-            for key, setting in SETTING_VARIABLES.items()
-            if setting in include
-        }
+        env: dict[str, Any] = self.model_dump(
+            mode="json", include={s.name for s in include}
+        )
 
         # Cast to strings and drop null values
         return {key: str(value) for key, value in env.items() if value is not None}
 
-    class Config:
-        frozen = True
+    model_config = ConfigDict(frozen=True)
 
 
 # Functions to instantiate `Settings` instances
 
-_DEFAULTS_CACHE: Settings = None
+_DEFAULTS_CACHE: Optional[Settings] = None
 _FROM_ENV_CACHE: Dict[int, Settings] = {}
 
 
@@ -1998,9 +1892,10 @@ class Profile(BaseModel):
 
     name: str
     settings: Dict[Setting, Any] = Field(default_factory=dict)
-    source: Optional[Path]
+    source: Optional[Path] = None
+    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=True)
 
-    @validator("settings", pre=True)
+    @field_validator("settings", mode="before")
     def map_names_to_settings(cls, value):
         return validate_settings(value)
 
@@ -2036,9 +1931,6 @@ class Profile(BaseModel):
                 )
                 changed.append((setting, setting.deprecated_renamed_to))
         return changed
-
-    class Config:
-        arbitrary_types_allowed = True
 
 
 class ProfilesCollection:
@@ -2194,26 +2086,6 @@ class ProfilesCollection:
         )
 
 
-def _handle_removed_flags(
-    profile_name: str, settings: Dict[str, Any]
-) -> Dict[str, Any]:
-    to_remove = [name for name in settings if name in REMOVED_EXPERIMENTAL_FLAGS]
-
-    for name in to_remove:
-        warnings.warn(
-            (
-                f"Experimental flag {name!r} has been removed, please "
-                f"update your {profile_name!r} profile."
-            ),
-            UserWarning,
-            stacklevel=3,
-        )
-
-        settings.pop(name)
-
-    return settings
-
-
 def _read_profiles_from(path: Path) -> ProfilesCollection:
     """
     Read profiles from a path into a new `ProfilesCollection`.
@@ -2232,7 +2104,6 @@ def _read_profiles_from(path: Path) -> ProfilesCollection:
 
     profiles = []
     for name, settings in raw_profiles.items():
-        settings = _handle_removed_flags(name, settings)
         profiles.append(Profile(name=name, settings=settings, source=path))
 
     return ProfilesCollection(profiles, active=active_profile)

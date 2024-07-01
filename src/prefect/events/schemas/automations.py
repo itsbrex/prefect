@@ -10,23 +10,20 @@ from typing import (
     Optional,
     Set,
     Union,
+    cast,
 )
 from uuid import UUID
 
-from typing_extensions import TypeAlias
-
-from prefect._internal.pydantic import HAS_PYDANTIC_V2
-from prefect._internal.schemas.validators import validate_trigger_within
-
-if HAS_PYDANTIC_V2:
-    from pydantic.v1 import Field, root_validator, validator
-    from pydantic.v1.fields import ModelField
-else:
-    from pydantic import Field, root_validator, validator
-    from pydantic.fields import ModelField
+from pydantic import (
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
+from typing_extensions import Self, TypeAlias
 
 from prefect._internal.schemas.bases import PrefectBaseModel
-from prefect.events.actions import ActionTypes
+from prefect.events.actions import ActionTypes, RunDeployment
 from prefect.utilities.collections import AutoEnum
 
 from .events import ResourceSpecification
@@ -38,7 +35,7 @@ class Posture(AutoEnum):
     Metric = "Metric"
 
 
-class Trigger(PrefectBaseModel, abc.ABC, extra="ignore"):
+class Trigger(PrefectBaseModel, abc.ABC, extra="ignore"):  # type: ignore[call-arg]
     """
     Base class describing a set of criteria that must be satisfied in order to trigger
     an automation.
@@ -50,6 +47,50 @@ class Trigger(PrefectBaseModel, abc.ABC, extra="ignore"):
     def describe_for_cli(self, indent: int = 0) -> str:
         """Return a human-readable description of this trigger for the CLI"""
 
+    # The following allows the regular Trigger class to be used when serving or
+    # deploying flows, analogous to how the Deployment*Trigger classes work
+
+    _deployment_id: Optional[UUID] = PrivateAttr(default=None)
+
+    def set_deployment_id(self, deployment_id: UUID):
+        self._deployment_id = deployment_id
+
+    def owner_resource(self) -> Optional[str]:
+        return f"prefect.deployment.{self._deployment_id}"
+
+    def actions(self) -> List[ActionTypes]:
+        assert self._deployment_id
+        return [
+            RunDeployment(
+                source="selected",
+                deployment_id=self._deployment_id,
+                parameters=getattr(self, "parameters", None),
+                job_variables=getattr(self, "job_variables", None),
+            )
+        ]
+
+    def as_automation(self) -> "AutomationCore":
+        assert self._deployment_id
+
+        trigger: TriggerTypes = cast(TriggerTypes, self)
+
+        # This is one of the Deployment*Trigger classes, so translate it over to a
+        # plain Trigger
+        if hasattr(self, "trigger_type"):
+            trigger = self.trigger_type(**self.model_dump())
+
+        return AutomationCore(
+            name=(
+                getattr(self, "name", None)
+                or f"Automation for deployment {self._deployment_id}"
+            ),
+            description="",
+            enabled=getattr(self, "enabled", True),
+            trigger=trigger,
+            actions=self.actions(),
+            owner_resource=self.owner_resource(),
+        )
+
 
 class ResourceTrigger(Trigger, abc.ABC):
     """
@@ -59,11 +100,11 @@ class ResourceTrigger(Trigger, abc.ABC):
     type: str
 
     match: ResourceSpecification = Field(
-        default_factory=lambda: ResourceSpecification.parse_obj({}),
+        default_factory=lambda: ResourceSpecification.model_validate({}),
         description="Labels for resources which this trigger will match.",
     )
     match_related: ResourceSpecification = Field(
-        default_factory=lambda: ResourceSpecification.parse_obj({}),
+        default_factory=lambda: ResourceSpecification.model_validate({}),
         description="Labels for related resources which this trigger will match.",
     )
 
@@ -122,9 +163,8 @@ class EventTrigger(ResourceTrigger):
         ),
     )
     within: timedelta = Field(
-        timedelta(0),
-        minimum=0.0,
-        exclusiveMinimum=False,
+        timedelta(seconds=0),
+        ge=timedelta(seconds=0),
         description=(
             "The time period over which the events must occur.  For Reactive triggers, "
             "this may be as low as 0 seconds, but must be at least 10 seconds for "
@@ -132,26 +172,33 @@ class EventTrigger(ResourceTrigger):
         ),
     )
 
-    @validator("within")
-    def enforce_minimum_within(
-        cls, value: timedelta, values, config, field: ModelField
-    ):
-        return validate_trigger_within(value, field)
+    @model_validator(mode="before")
+    @classmethod
+    def enforce_minimum_within_for_proactive_triggers(
+        cls, data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            return data
 
-    @root_validator(skip_on_failure=True)
-    def enforce_minimum_within_for_proactive_triggers(cls, values: Dict[str, Any]):
-        posture: Optional[Posture] = values.get("posture")
-        within: Optional[timedelta] = values.get("within")
+        if "within" in data and data["within"] is None:
+            raise ValueError("`within` should be a valid timedelta")
+
+        posture: Optional[Posture] = data.get("posture")
+        within: Optional[timedelta] = data.get("within")
+
+        if isinstance(within, (int, float)):
+            within = timedelta(seconds=within)
 
         if posture == Posture.Proactive:
             if not within or within == timedelta(0):
-                values["within"] = timedelta(seconds=10.0)
+                within = timedelta(seconds=10.0)
             elif within < timedelta(seconds=10.0):
                 raise ValueError(
-                    "The minimum within for Proactive triggers is 10 seconds"
+                    "`within` for Proactive triggers must be greater than or equal to "
+                    "10 seconds"
                 )
 
-        return values
+        return data | {"within": within} if within else data
 
     def describe_for_cli(self, indent: int = 0) -> str:
         """Return a human-readable description of this trigger for the CLI"""
@@ -213,8 +260,6 @@ class MetricTriggerQuery(PrefectBaseModel):
     )
     range: timedelta = Field(
         timedelta(seconds=300),  # defaults to 5 minutes
-        minimum=300.0,
-        exclusiveMinimum=False,
         description=(
             "The lookback duration (seconds) for a metric query. This duration is "
             "used to determine the time range over which the query will be executed. "
@@ -223,8 +268,6 @@ class MetricTriggerQuery(PrefectBaseModel):
     )
     firing_for: timedelta = Field(
         timedelta(seconds=300),  # defaults to 5 minutes
-        minimum=300.0,
-        exclusiveMinimum=False,
         description=(
             "The duration (seconds) for which the metric query must breach "
             "or resolve continuously before the state is updated and the "
@@ -232,6 +275,12 @@ class MetricTriggerQuery(PrefectBaseModel):
             "The minimum value is 300 seconds (5 minutes)."
         ),
     )
+
+    @field_validator("range", "firing_for")
+    def enforce_minimum_range(cls, value: timedelta):
+        if value < timedelta(seconds=300):
+            raise ValueError("The minimum range is 300 seconds (5 minutes)")
+        return value
 
 
 class MetricTrigger(ResourceTrigger):
@@ -271,7 +320,14 @@ class CompositeTrigger(Trigger, abc.ABC):
 
     type: Literal["compound", "sequence"]
     triggers: List["TriggerTypes"]
-    within: Optional[timedelta]
+    within: Optional[timedelta] = Field(
+        None,
+        description=(
+            "The time period over which the events must occur.  For Reactive triggers, "
+            "this may be as low as 0 seconds, but must be at least 10 seconds for "
+            "Proactive triggers"
+        ),
+    )
 
 
 class CompoundTrigger(CompositeTrigger):
@@ -281,19 +337,17 @@ class CompoundTrigger(CompositeTrigger):
     type: Literal["compound"] = "compound"
     require: Union[int, Literal["any", "all"]]
 
-    @root_validator
-    def validate_require(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        require = values.get("require")
-
-        if isinstance(require, int):
-            if require < 1:
-                raise ValueError("required must be at least 1")
-            if require > len(values["triggers"]):
+    @model_validator(mode="after")
+    def validate_require(self) -> Self:
+        if isinstance(self.require, int):
+            if self.require < 1:
+                raise ValueError("require must be at least 1")
+            if self.require > len(self.triggers):
                 raise ValueError(
-                    "required must be less than or equal to the number of triggers"
+                    "require must be less than or equal to the number of triggers"
                 )
 
-        return values
+        return self
 
     def describe_for_cli(self, indent: int = 0) -> str:
         """Return a human-readable description of this trigger for the CLI"""
@@ -342,11 +396,11 @@ TriggerTypes: TypeAlias = Union[
 ]
 """The union of all concrete trigger types that a user may actually create"""
 
-CompoundTrigger.update_forward_refs()
-SequenceTrigger.update_forward_refs()
+CompoundTrigger.model_rebuild()
+SequenceTrigger.model_rebuild()
 
 
-class AutomationCore(PrefectBaseModel, extra="ignore"):
+class AutomationCore(PrefectBaseModel, extra="ignore"):  # type: ignore[call-arg]
     """Defines an action a user wants to take when a certain number of events
     do or don't happen to the matching resources"""
 

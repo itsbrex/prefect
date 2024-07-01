@@ -1,53 +1,42 @@
 import asyncio
-import json
 from datetime import timedelta
-from typing import AsyncGenerator, Sequence
+from typing import TYPE_CHECKING, AsyncGenerator, Optional, Sequence
 from uuid import UUID, uuid4
 
-import pendulum
 import pytest
 import sqlalchemy as sa
-from pendulum.datetime import DateTime
 from pydantic import ValidationError
+from pydantic_extra_types.pendulum_dt import DateTime
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from prefect._internal.pydantic import HAS_PYDANTIC_V2
 from prefect.server.database.dependencies import db_injector
 from prefect.server.database.interface import PrefectDBInterface
-from prefect.server.database.orm_models import ORMEventResource
+from prefect.server.events.filters import EventFilter
 from prefect.server.events.schemas.events import ReceivedEvent
 from prefect.server.events.services import event_persister
+from prefect.server.events.storage.database import query_events, write_events
 from prefect.server.utilities.messaging import CapturedMessage, Message, MessageHandler
+from prefect.settings import PREFECT_EVENTS_RETENTION_PERIOD, temporary_settings
 
-if HAS_PYDANTIC_V2:
-    from pydantic.v1 import ValidationError
-else:
-    from pydantic import ValidationError
+if TYPE_CHECKING:
+    from prefect.server.database.orm_models import ORMEventResource
 
 
 @db_injector
-async def get_event(db: PrefectDBInterface, id: UUID) -> "ReceivedEvent | None":
+async def get_event(db: PrefectDBInterface, id: UUID) -> Optional[ReceivedEvent]:
     async with await db.session() as session:
-        result = await session.execute(
-            sa.text("SELECT * FROM events WHERE id = :id"),
-            params={"id": str(id)},
-        )
-        event = result.mappings().fetchone()
-        if db.uses_json_strings:
-            event = dict(event)
-            event["resource"] = json.loads(event["resource"])
-            event["related"] = json.loads(event["related"])
-            event["payload"] = json.loads(event["payload"])
+        result = await session.execute(sa.select(db.Event).where(db.Event.id == id))
+        event = result.scalar_one_or_none()
 
         if not event:
             return None
 
-        return ReceivedEvent.parse_obj(event)
+        return ReceivedEvent.model_validate(event)
 
 
 async def get_resources(
     session: AsyncSession, id: UUID, db: PrefectDBInterface
-) -> Sequence[ORMEventResource]:
+) -> Sequence["ORMEventResource"]:
     result = await session.execute(
         sa.select(db.EventResource)
         .where(db.EventResource.event_id == id)
@@ -70,7 +59,7 @@ async def event_persister_handler() -> AsyncGenerator[MessageHandler, None]:
 @pytest.fixture
 def event() -> ReceivedEvent:
     return ReceivedEvent(
-        occurred=pendulum.now("UTC"),
+        occurred=DateTime.now("UTC"),
         event="hello",
         resource={"prefect.resource.id": "my.resource.id", "label-1": "value-1"},
         related=[
@@ -94,7 +83,7 @@ def event() -> ReceivedEvent:
             },
         ],
         payload={"hello": "world"},
-        received=pendulum.datetime(2022, 2, 3, 4, 5, 6, 7, "UTC"),
+        received=DateTime(2022, 2, 3, 4, 5, 6, 7).in_timezone("UTC"),
         id=uuid4(),
         follows=UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"),
     )
@@ -103,7 +92,7 @@ def event() -> ReceivedEvent:
 @pytest.fixture
 def message(event: ReceivedEvent) -> Message:
     return CapturedMessage(
-        data=event.json().encode(),
+        data=event.model_dump_json().encode(),
         attributes={},
     )
 
@@ -134,7 +123,7 @@ async def test_handling_message_writes_event(
     stored_event = await get_event(event.id)
     assert stored_event
     assert stored_event == ReceivedEvent(
-        occurred=pendulum.now("UTC"),
+        occurred=stored_event.occurred,  # avoid microsecond differences
         event="hello",
         resource={"prefect.resource.id": "my.resource.id", "label-1": "value-1"},
         related=[
@@ -158,7 +147,7 @@ async def test_handling_message_writes_event(
             },
         ],
         payload={"hello": "world"},
-        received=pendulum.datetime(2022, 2, 3, 4, 5, 6, 7, "UTC"),
+        received=DateTime(2022, 2, 3, 4, 5, 6, 7).in_timezone("UTC"),
         id=event.id,
         follows=UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"),
     )
@@ -274,7 +263,7 @@ async def test_sends_remaining_messages(
         for _ in range(10):
             event.id = uuid4()
             message = CapturedMessage(
-                data=event.json().encode(),
+                data=event.model_dump_json().encode(),
                 attributes={},
             )
             await handler(message)
@@ -294,7 +283,7 @@ async def test_flushes_messages_periodically(
         for _ in range(9):
             event.id = uuid4()
             message = CapturedMessage(
-                data=event.json().encode(),
+                data=event.model_dump_json().encode(),
                 attributes={},
             )
             await handler(message)
@@ -304,3 +293,43 @@ async def test_flushes_messages_periodically(
         # no matter how many batches this ended up being distributed over due to the
         # periodic flushes, we should definitely have flushed all of the records by here
         assert (await get_event_count(session)) == 9
+
+
+async def test_trims_messages_periodically(
+    event: ReceivedEvent,
+    session: AsyncSession,
+):
+    await write_events(
+        session,
+        [
+            event.model_copy(
+                update={
+                    "id": uuid4(),
+                    "occurred": DateTime.now("UTC") - timedelta(days=i),
+                }
+            )
+            for i in range(10)
+        ],
+    )
+    await session.commit()
+
+    five_days_ago = DateTime.now("UTC") - timedelta(days=5)
+
+    initial_events, total, _ = await query_events(session, filter=EventFilter())
+    assert total == 10
+    assert len(initial_events) == 10
+    assert any(event.occurred < five_days_ago for event in initial_events)
+    assert any(event.occurred >= five_days_ago for event in initial_events)
+
+    with temporary_settings({PREFECT_EVENTS_RETENTION_PERIOD: timedelta(days=5)}):
+        async with event_persister.create_handler(
+            flush_every=timedelta(seconds=0.001),
+            trim_every=timedelta(seconds=0.001),
+        ):
+            await asyncio.sleep(0.1)  # this is 100x the time necessary
+
+    remaining_events, total, _ = await query_events(session, filter=EventFilter())
+    assert total == 5
+    assert len(remaining_events) == 5
+
+    assert all(event.occurred >= five_days_ago for event in remaining_events)

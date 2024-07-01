@@ -5,7 +5,7 @@ import warnings
 from builtins import print
 from contextlib import contextmanager
 from functools import lru_cache
-from logging import LogRecord
+from logging import LoggerAdapter, LogRecord
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from typing_extensions import Self
@@ -69,7 +69,7 @@ class PrefectLogAdapter(logging.LoggerAdapter):
 
 
 @lru_cache()
-def get_logger(name: str = None) -> logging.Logger:
+def get_logger(name: Optional[str] = None) -> logging.Logger:
     """
     Get a `prefect` logger. These loggers are intended for internal use within the
     `prefect` package.
@@ -115,7 +115,7 @@ def get_run_logger(
             addition to the run metadata
 
     Raises:
-        RuntimeError: If no context can be found
+        MissingContextError: If no context can be found
     """
     # Check for existing contexts
     task_run_context = prefect.context.TaskRunContext.get()
@@ -161,7 +161,7 @@ def flow_run_logger(
     flow_run: Union["FlowRun", "ClientFlowRun"],
     flow: Optional["Flow"] = None,
     **kwargs: str,
-):
+) -> LoggerAdapter:
     """
     Create a flow run logger with the run's metadata attached.
 

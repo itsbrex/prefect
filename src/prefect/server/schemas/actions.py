@@ -4,29 +4,19 @@ Reduced schemas for accepting API actions.
 
 import json
 from copy import deepcopy
-from typing import Any, Dict, Generator, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 from uuid import UUID, uuid4
 
-import jsonschema
-
-from prefect._internal.compatibility.deprecated import DeprecatedInfraOverridesField
-from prefect._internal.pydantic import HAS_PYDANTIC_V2
-from prefect.types import NonNegativeInteger, PositiveInteger
-
-if HAS_PYDANTIC_V2:
-    from pydantic.v1 import Field, HttpUrl, root_validator, validator
-else:
-    from pydantic import Field, HttpUrl, root_validator, validator
+import pendulum
+from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic_extra_types.pendulum_dt import DateTime
 
 import prefect.server.schemas as schemas
 from prefect._internal.schemas.validators import (
     get_or_create_run_name,
-    get_or_create_state_name,
     raise_on_name_alphanumeric_dashes_only,
     raise_on_name_alphanumeric_underscores_only,
-    raise_on_name_with_banned_characters,
     remove_old_deployment_fields,
-    set_default_scheduled_time,
     set_deployment_schedules,
     validate_cache_key_length,
     validate_max_metadata_length,
@@ -35,11 +25,20 @@ from prefect._internal.schemas.validators import (
     validate_parameter_openapi_schema,
     validate_parameters_conform_to_schema,
     validate_parent_and_ref_diff,
+    validate_schedule_max_scheduled_runs,
 )
 from prefect.server.utilities.schemas import get_class_fields_only
 from prefect.server.utilities.schemas.bases import PrefectBaseModel
-from prefect.server.utilities.schemas.fields import DateTimeTZ
-from prefect.server.utilities.schemas.serializers import orjson_dumps_extra_compatible
+from prefect.settings import PREFECT_DEPLOYMENT_SCHEDULE_MAX_SCHEDULED_RUNS
+from prefect.types import (
+    MAX_VARIABLE_NAME_LENGTH,
+    Name,
+    NonEmptyishName,
+    NonNegativeFloat,
+    NonNegativeInteger,
+    PositiveInteger,
+    StrictVariableValue,
+)
 from prefect.utilities.collections import listrepr
 from prefect.utilities.names import generate_slug
 from prefect.utilities.templating import find_placeholders
@@ -68,30 +67,13 @@ def validate_variable_name(value):
 
 
 class ActionBaseModel(PrefectBaseModel):
-    class Config:
-        extra = "forbid"
-
-    def __iter__(self):
-        # By default, `pydantic.BaseModel.__iter__` yields from `self.__dict__` directly
-        # instead  of going through `_iter`. We want tor retain our custom logic in
-        # `_iter` during `dict(model)` calls which is what Pydantic uses for
-        # `parse_obj(model)`
-        yield from self._iter(to_dict=True)
-
-    def _iter(self, *args, **kwargs) -> Generator[tuple, None, None]:
-        # Drop fields that are marked as `ignored` from json and dictionary outputs
-        exclude = kwargs.pop("exclude", None) or set()
-        for name, field in self.__fields__.items():
-            if field.field_info.extra.get("ignored"):
-                exclude.add(name)
-
-        return super()._iter(*args, **kwargs, exclude=exclude)
+    model_config = ConfigDict(extra="forbid")
 
 
 class FlowCreate(ActionBaseModel):
     """Data used by the Prefect REST API to create a flow."""
 
-    name: str = Field(
+    name: Name = Field(
         default=..., description="The name of the flow", examples=["my-flow"]
     )
     tags: List[str] = Field(
@@ -99,10 +81,6 @@ class FlowCreate(ActionBaseModel):
         description="A list of flow tags",
         examples=[["tag-1", "tag-2"]],
     )
-
-    @validator("name", check_fields=False)
-    def validate_name_characters(cls, v):
-        return raise_on_name_with_banned_characters(v)
 
 
 class FlowUpdate(ActionBaseModel):
@@ -114,10 +92,6 @@ class FlowUpdate(ActionBaseModel):
         examples=[["tag-1", "tag-2"]],
     )
 
-    @validator("name", check_fields=False)
-    def validate_name_characters(cls, v):
-        return raise_on_name_with_banned_characters(v)
-
 
 class DeploymentScheduleCreate(ActionBaseModel):
     active: bool = Field(
@@ -126,6 +100,25 @@ class DeploymentScheduleCreate(ActionBaseModel):
     schedule: schemas.schedules.SCHEDULE_TYPES = Field(
         default=..., description="The schedule for the deployment."
     )
+    max_active_runs: Optional[PositiveInteger] = Field(
+        default=None,
+        description="The maximum number of active runs for the schedule.",
+    )
+    max_scheduled_runs: Optional[PositiveInteger] = Field(
+        default=None,
+        description="The maximum number of scheduled runs for the schedule.",
+    )
+    catchup: bool = Field(
+        default=False,
+        description="Whether or not a worker should catch up on Late runs for the schedule.",
+    )
+
+    @field_validator("max_scheduled_runs")
+    @classmethod
+    def validate_max_scheduled_runs(cls, v):
+        return validate_schedule_max_scheduled_runs(
+            v, PREFECT_DEPLOYMENT_SCHEDULE_MAX_SCHEDULED_RUNS.value()
+        )
 
 
 class DeploymentScheduleUpdate(ActionBaseModel):
@@ -136,17 +129,31 @@ class DeploymentScheduleUpdate(ActionBaseModel):
         default=None, description="The schedule for the deployment."
     )
 
+    max_active_runs: Optional[PositiveInteger] = Field(
+        default=None,
+        description="The maximum number of active runs for the schedule.",
+    )
 
-class DeploymentCreate(DeprecatedInfraOverridesField, ActionBaseModel):
+    max_scheduled_runs: Optional[PositiveInteger] = Field(
+        default=None,
+        description="The maximum number of scheduled runs for the schedule.",
+    )
+
+    catchup: Optional[bool] = Field(
+        default=None,
+        description="Whether or not a worker should catch up on Late runs for the schedule.",
+    )
+
+    @field_validator("max_scheduled_runs")
+    @classmethod
+    def validate_max_scheduled_runs(cls, v):
+        return validate_schedule_max_scheduled_runs(
+            v, PREFECT_DEPLOYMENT_SCHEDULE_MAX_SCHEDULED_RUNS.value()
+        )
+
+
+class DeploymentCreate(ActionBaseModel):
     """Data used by the Prefect REST API to create a deployment."""
-
-    @root_validator
-    def populate_schedules(cls, values):
-        return set_deployment_schedules(values)
-
-    @root_validator(pre=True)
-    def remove_old_fields(cls, values):
-        return remove_old_deployment_fields(values)
 
     name: str = Field(
         default=...,
@@ -167,13 +174,13 @@ class DeploymentCreate(DeprecatedInfraOverridesField, ActionBaseModel):
         description="A list of schedules for the deployment.",
     )
     enforce_parameter_schema: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Whether or not the deployment should enforce the parameter schema."
         ),
     )
     parameter_openapi_schema: Optional[Dict[str, Any]] = Field(
-        default=None,
+        default_factory=dict,
         description="The parameter schema of the flow, including defaults.",
     )
     parameters: Dict[str, Any] = Field(
@@ -187,7 +194,6 @@ class DeploymentCreate(DeprecatedInfraOverridesField, ActionBaseModel):
     )
     pull_steps: Optional[List[dict]] = Field(None)
 
-    manifest_path: Optional[str] = Field(None)
     work_queue_name: Optional[str] = Field(None)
     work_pool_name: Optional[str] = Field(
         default=None,
@@ -209,37 +215,54 @@ class DeploymentCreate(DeprecatedInfraOverridesField, ActionBaseModel):
     )
 
     def check_valid_configuration(self, base_job_template: dict):
-        """Check that the combination of base_job_template defaults
-        and job_variables conforms to the specified schema.
         """
+        Check that the combination of base_job_template defaults and job_variables
+        conforms to the specified schema.
+
+        NOTE: This method does not hydrate block references in default values within the
+        base job template to validate them. Failing to do this can cause user-facing
+        errors. Instead of this method, use `validate_job_variables_for_deployment`
+        function from `prefect_cloud.orion.api.validation`.
+        """
+        # This import is here to avoid a circular import
+        from prefect.utilities.schema_tools import validate
+
         variables_schema = deepcopy(base_job_template.get("variables"))
 
         if variables_schema is not None:
-            # jsonschema considers required fields, even if that field has a default,
-            # to still be required. To get around this we remove the fields from
-            # required if there is a default present.
-            required = variables_schema.get("required")
-            properties = variables_schema.get("properties")
-            if required is not None and properties is not None:
-                for k, v in properties.items():
-                    if "default" in v and k in required:
-                        required.remove(k)
+            validate(
+                self.job_variables,
+                variables_schema,
+                raise_on_error=True,
+                preprocess=True,
+                ignore_required=True,
+            )
 
-            jsonschema.validate(self.job_variables, variables_schema)
+    @model_validator(mode="before")
+    def populate_schedules(cls, values):
+        return set_deployment_schedules(values)
 
-    @validator("parameters")
-    def _validate_parameters_conform_to_schema(cls, value, values):
-        return validate_parameters_conform_to_schema(value, values)
+    @model_validator(mode="before")
+    @classmethod
+    def remove_old_fields(cls, values):
+        return remove_old_deployment_fields(values)
 
-    @validator("parameter_openapi_schema")
-    def _validate_parameter_openapi_schema(cls, value, values):
-        return validate_parameter_openapi_schema(value, values)
+    @model_validator(mode="before")
+    def _validate_parameters_conform_to_schema(cls, values):
+        values["parameters"] = validate_parameters_conform_to_schema(
+            values.get("parameters", {}), values
+        )
+        values["parameter_openapi_schema"] = validate_parameter_openapi_schema(
+            values.get("parameter_openapi_schema"), values
+        )
+        return values
 
 
-class DeploymentUpdate(DeprecatedInfraOverridesField, ActionBaseModel):
+class DeploymentUpdate(ActionBaseModel):
     """Data used by the Prefect REST API to update a deployment."""
 
-    @root_validator(pre=True)
+    @model_validator(mode="before")
+    @classmethod
     def remove_old_fields(cls, values):
         return remove_old_deployment_fields(values)
 
@@ -279,7 +302,6 @@ class DeploymentUpdate(DeprecatedInfraOverridesField, ActionBaseModel):
         description="Overrides for the flow's infrastructure configuration.",
     )
     entrypoint: Optional[str] = Field(None)
-    manifest_path: Optional[str] = Field(None)
     storage_document_id: Optional[UUID] = Field(None)
     infrastructure_document_id: Optional[UUID] = Field(None)
     enforce_parameter_schema: Optional[bool] = Field(
@@ -288,29 +310,34 @@ class DeploymentUpdate(DeprecatedInfraOverridesField, ActionBaseModel):
             "Whether or not the deployment should enforce the parameter schema."
         ),
     )
-
-    class Config:
-        allow_population_by_field_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
     def check_valid_configuration(self, base_job_template: dict):
-        """Check that the combination of base_job_template defaults
-        and job_variables conforms to the specified schema.
         """
+        Check that the combination of base_job_template defaults and job_variables
+        conforms to the schema specified in the base_job_template.
+
+        NOTE: This method does not hydrate block references in default values within the
+        base job template to validate them. Failing to do this can cause user-facing
+        errors. Instead of this method, use `validate_job_variables_for_deployment`
+        function from `prefect_cloud.orion.api.validation`.
+        """
+        # This import is here to avoid a circular import
+        from prefect.utilities.schema_tools import validate
+
         variables_schema = deepcopy(base_job_template.get("variables"))
 
         if variables_schema is not None:
-            # jsonschema considers required fields, even if that field has a default,
-            # to still be required. To get around this we remove the fields from
-            # required if there is a default present.
-            required = variables_schema.get("required")
-            properties = variables_schema.get("properties")
-            if required is not None and properties is not None:
-                for k, v in properties.items():
-                    if "default" in v and k in required:
-                        required.remove(k)
-
-        if variables_schema is not None:
-            jsonschema.validate(self.job_variables, variables_schema)
+            errors = validate(
+                self.job_variables,
+                variables_schema,
+                raise_on_error=False,
+                preprocess=True,
+                ignore_required=True,
+            )
+            if errors:
+                for error in errors:
+                    raise error
 
 
 class FlowRunUpdate(ActionBaseModel):
@@ -326,7 +353,8 @@ class FlowRunUpdate(ActionBaseModel):
     infrastructure_pid: Optional[str] = Field(None)
     job_variables: Optional[Dict[str, Any]] = Field(None)
 
-    @validator("name", pre=True)
+    @field_validator("name", mode="before")
+    @classmethod
     def set_name(cls, name):
         return get_or_create_run_name(name)
 
@@ -351,25 +379,34 @@ class StateCreate(ActionBaseModel):
         description="The details of the state to create",
     )
 
-    timestamp: Optional[DateTimeTZ] = Field(
-        default=None,
-        repr=False,
-        ignored=True,
-    )
-    id: Optional[UUID] = Field(default=None, repr=False, ignored=True)
+    @model_validator(mode="after")
+    def default_name_from_type(self):
+        """If a name is not provided, use the type"""
+        # if `type` is not in `values` it means the `type` didn't pass its own
+        # validation check and an error will be raised after this function is called
+        name = self.name
+        if name is None and self.type:
+            self.name = " ".join([v.capitalize() for v in self.type.value.split("_")])
+        return self
 
-    @validator("name", always=True)
-    def default_name_from_type(cls, v, *, values, **kwargs):
-        return get_or_create_state_name(v, values)
+    @model_validator(mode="after")
+    def default_scheduled_start_time(self):
+        from prefect.server.schemas.states import StateType
 
-    @root_validator
-    def default_scheduled_start_time(cls, values):
-        return set_default_scheduled_time(cls, values)
+        if self.type == StateType.SCHEDULED:
+            if not self.state_details.scheduled_time:
+                self.state_details.scheduled_time = pendulum.now("utc")
+
+        return self
 
 
 class TaskRunCreate(ActionBaseModel):
     """Data used by the Prefect REST API to create a task run"""
 
+    id: Optional[UUID] = Field(
+        default=None,
+        description="The ID to assign to the task run. If not provided, a random UUID will be generated.",
+    )
     # TaskRunCreate states must be provided as StateCreate objects
     state: Optional[StateCreate] = Field(
         default=None, description="The state of the task run to create"
@@ -399,7 +436,7 @@ class TaskRunCreate(ActionBaseModel):
             " the task run."
         ),
     )
-    cache_expiration: Optional[DateTimeTZ] = Field(
+    cache_expiration: Optional[DateTime] = Field(
         default=None, description="Specifies when the cached state should expire."
     )
     task_version: Optional[str] = Field(
@@ -427,11 +464,13 @@ class TaskRunCreate(ActionBaseModel):
         description="The inputs to the task run.",
     )
 
-    @validator("name", pre=True)
+    @field_validator("name", mode="before")
+    @classmethod
     def set_name(cls, name):
         return get_or_create_run_name(name)
 
-    @validator("cache_key")
+    @field_validator("cache_key")
+    @classmethod
     def validate_cache_key(cls, cache_key):
         return validate_cache_key_length(cache_key)
 
@@ -443,7 +482,8 @@ class TaskRunUpdate(ActionBaseModel):
         default_factory=lambda: generate_slug(2), examples=["my-task-run"]
     )
 
-    @validator("name", pre=True)
+    @field_validator("name", mode="before")
+    @classmethod
     def set_name(cls, name):
         return get_or_create_run_name(name)
 
@@ -504,10 +544,8 @@ class FlowRunCreate(ActionBaseModel):
         deprecated=True,
     )
 
-    class Config(ActionBaseModel.Config):
-        json_dumps = orjson_dumps_extra_compatible
-
-    @validator("name", pre=True)
+    @field_validator("name", mode="before")
+    @classmethod
     def set_name(cls, name):
         return get_or_create_run_name(name)
 
@@ -550,7 +588,8 @@ class DeploymentFlowRunCreate(ActionBaseModel):
     work_queue_name: Optional[str] = Field(None)
     job_variables: Optional[Dict[str, Any]] = Field(None)
 
-    @validator("name", pre=True)
+    @field_validator("name", mode="before")
+    @classmethod
     def set_name(cls, name):
         return get_or_create_run_name(name)
 
@@ -579,40 +618,40 @@ class ConcurrencyLimitV2Create(ActionBaseModel):
     active: bool = Field(
         default=True, description="Whether the concurrency limit is active."
     )
-    name: str = Field(default=..., description="The name of the concurrency limit.")
-    limit: int = Field(default=..., description="The concurrency limit.")
-    active_slots: int = Field(default=0, description="The number of active slots.")
-    denied_slots: int = Field(default=0, description="The number of denied slots.")
-    slot_decay_per_second: float = Field(
+    name: Name = Field(default=..., description="The name of the concurrency limit.")
+    limit: NonNegativeInteger = Field(default=..., description="The concurrency limit.")
+    active_slots: NonNegativeInteger = Field(
+        default=0, description="The number of active slots."
+    )
+    denied_slots: NonNegativeInteger = Field(
+        default=0, description="The number of denied slots."
+    )
+    slot_decay_per_second: NonNegativeFloat = Field(
         default=0,
         description="The decay rate for active slots when used as a rate limit.",
     )
-
-    @validator("name", check_fields=False)
-    def validate_name_characters(cls, v):
-        return raise_on_name_with_banned_characters(v)
 
 
 class ConcurrencyLimitV2Update(ActionBaseModel):
     """Data used by the Prefect REST API to update a v2 concurrency limit."""
 
     active: Optional[bool] = Field(None)
-    name: Optional[str] = Field(None)
-    limit: Optional[int] = Field(None)
-    active_slots: Optional[int] = Field(None)
-    denied_slots: Optional[int] = Field(None)
-    slot_decay_per_second: Optional[float] = Field(None)
+    name: Optional[Name] = Field(None)
+    limit: Optional[NonNegativeInteger] = Field(None)
+    active_slots: Optional[NonNegativeInteger] = Field(None)
+    denied_slots: Optional[NonNegativeInteger] = Field(None)
+    slot_decay_per_second: Optional[NonNegativeFloat] = Field(None)
 
 
 class BlockTypeCreate(ActionBaseModel):
     """Data used by the Prefect REST API to create a block type."""
 
-    name: str = Field(default=..., description="A block type's name")
+    name: Name = Field(default=..., description="A block type's name")
     slug: str = Field(default=..., description="A block type's slug")
-    logo_url: Optional[HttpUrl] = Field(
+    logo_url: Optional[str] = Field(  # TODO: HttpUrl
         default=None, description="Web URL for the block type's logo"
     )
-    documentation_url: Optional[HttpUrl] = Field(
+    documentation_url: Optional[str] = Field(  # TODO: HttpUrl
         default=None, description="Web URL for the block type's documentation"
     )
     description: Optional[str] = Field(
@@ -625,20 +664,14 @@ class BlockTypeCreate(ActionBaseModel):
     )
 
     # validators
-    _validate_slug_format = validator("slug", allow_reuse=True)(
-        validate_block_type_slug
-    )
-
-    _validate_name_characters = validator("name", check_fields=False)(
-        raise_on_name_with_banned_characters
-    )
+    _validate_slug_format = field_validator("slug")(validate_block_type_slug)
 
 
 class BlockTypeUpdate(ActionBaseModel):
     """Data used by the Prefect REST API to update a block type."""
 
-    logo_url: Optional[schemas.core.HttpUrl] = Field(None)
-    documentation_url: Optional[schemas.core.HttpUrl] = Field(None)
+    logo_url: Optional[str] = Field(None)  # TODO: HttpUrl
+    documentation_url: Optional[str] = Field(None)  # TODO: HttpUrl
     description: Optional[str] = Field(None)
     code_example: Optional[str] = Field(None)
 
@@ -653,7 +686,7 @@ class BlockSchemaCreate(ActionBaseModel):
     fields: Dict[str, Any] = Field(
         default_factory=dict, description="The block schema's field schema"
     )
-    block_type_id: Optional[UUID] = Field(default=..., description="A block type ID")
+    block_type_id: UUID = Field(default=..., description="A block type ID")
 
     capabilities: List[str] = Field(
         default_factory=list,
@@ -689,11 +722,9 @@ class BlockDocumentCreate(ActionBaseModel):
         ),
     )
 
-    _validate_name_format = validator("name", allow_reuse=True)(
-        validate_block_document_name
-    )
+    _validate_name_format = field_validator("name")(validate_block_document_name)
 
-    @root_validator
+    @model_validator(mode="before")
     def validate_name_is_present_if_not_anonymous(cls, values):
         return validate_name_present_on_nonanonymous_blocks(values)
 
@@ -726,7 +757,7 @@ class BlockDocumentReferenceCreate(ActionBaseModel):
         default=..., description="The name that the reference is nested under"
     )
 
-    @root_validator
+    @model_validator(mode="before")
     def validate_parent_and_ref_are_different(cls, values):
         return validate_parent_and_ref_diff(values)
 
@@ -737,7 +768,7 @@ class LogCreate(ActionBaseModel):
     name: str = Field(default=..., description="The logger name.")
     level: int = Field(default=..., description="The log level.")
     message: str = Field(default=..., description="The log message.")
-    timestamp: DateTimeTZ = Field(default=..., description="The log timestamp.")
+    timestamp: DateTime = Field(default=..., description="The log timestamp.")
     flow_run_id: Optional[UUID] = Field(None)
     task_run_id: Optional[UUID] = Field(None)
 
@@ -747,8 +778,8 @@ def validate_base_job_template(v):
         return v
 
     job_config = v.get("job_configuration")
-    variables = v.get("variables")
-    if not (job_config and variables):
+    variables_schema = v.get("variables")
+    if not (job_config and variables_schema):
         raise ValueError(
             "The `base_job_template` must contain both a `job_configuration` key"
             " and a `variables` key."
@@ -761,7 +792,7 @@ def validate_base_job_template(v):
         found_variables = find_placeholders(json.dumps(template))
         template_variables.update({placeholder.name for placeholder in found_variables})
 
-    provided_variables = set(variables["properties"].keys())
+    provided_variables = set(variables_schema.get("properties", {}).keys())
     if not template_variables.issubset(provided_variables):
         missing_variables = template_variables - provided_variables
         raise ValueError(
@@ -776,7 +807,7 @@ def validate_base_job_template(v):
 class WorkPoolCreate(ActionBaseModel):
     """Data used by the Prefect REST API to create a work pool."""
 
-    name: str = Field(..., description="The name of the work pool.")
+    name: NonEmptyishName = Field(..., description="The name of the work pool.")
     description: Optional[str] = Field(None, description="The work pool description.")
     type: str = Field(description="The work pool type.", default="prefect-agent")
     base_job_template: Dict[str, Any] = Field(
@@ -790,13 +821,9 @@ class WorkPoolCreate(ActionBaseModel):
         default=None, description="A concurrency limit for the work pool."
     )
 
-    _validate_base_job_template = validator("base_job_template", allow_reuse=True)(
+    _validate_base_job_template = field_validator("base_job_template")(
         validate_base_job_template
     )
-
-    @validator("name", check_fields=False)
-    def validate_name_characters(cls, v):
-        return raise_on_name_with_banned_characters(v)
 
 
 class WorkPoolUpdate(ActionBaseModel):
@@ -807,19 +834,15 @@ class WorkPoolUpdate(ActionBaseModel):
     base_job_template: Optional[Dict[str, Any]] = Field(None)
     concurrency_limit: Optional[NonNegativeInteger] = Field(None)
 
-    _validate_base_job_template = validator("base_job_template", allow_reuse=True)(
+    _validate_base_job_template = field_validator("base_job_template")(
         validate_base_job_template
     )
-
-    @validator("name", check_fields=False)
-    def validate_name_characters(cls, v):
-        return raise_on_name_with_banned_characters(v)
 
 
 class WorkQueueCreate(ActionBaseModel):
     """Data used by the Prefect REST API to create a work queue."""
 
-    name: str = Field(default=..., description="The name of the work queue.")
+    name: Name = Field(default=..., description="The name of the work queue.")
     description: Optional[str] = Field(
         default="", description="An optional description for the work queue."
     )
@@ -844,10 +867,6 @@ class WorkQueueCreate(ActionBaseModel):
         deprecated=True,
     )
 
-    @validator("name", check_fields=False)
-    def validate_name_characters(cls, v):
-        return raise_on_name_with_banned_characters(v)
-
 
 class WorkQueueUpdate(ActionBaseModel):
     """Data used by the Prefect REST API to update a work queue."""
@@ -859,7 +878,7 @@ class WorkQueueUpdate(ActionBaseModel):
     )
     concurrency_limit: Optional[NonNegativeInteger] = Field(None)
     priority: Optional[PositiveInteger] = Field(None)
-    last_polled: Optional[DateTimeTZ] = Field(None)
+    last_polled: Optional[DateTime] = Field(None)
 
     # DEPRECATED
 
@@ -899,7 +918,8 @@ class FlowRunNotificationPolicyCreate(ActionBaseModel):
         ],
     )
 
-    @validator("message_template")
+    @field_validator("message_template")
+    @classmethod
     def validate_message_template_variables(cls, v):
         return validate_message_template_variables(v)
 
@@ -913,7 +933,8 @@ class FlowRunNotificationPolicyUpdate(ActionBaseModel):
     block_document_id: Optional[UUID] = Field(None)
     message_template: Optional[str] = Field(None)
 
-    @validator("message_template")
+    @field_validator("message_template")
+    @classmethod
     def validate_message_template_variables(cls, v):
         return validate_message_template_variables(v)
 
@@ -973,11 +994,11 @@ class ArtifactCreate(ActionBaseModel):
 
         return cls(data=data, **artifact_info)
 
-    _validate_metadata_length = validator("metadata_")(validate_max_metadata_length)
-
-    _validate_artifact_format = validator("key", allow_reuse=True)(
-        validate_artifact_key
+    _validate_metadata_length = field_validator("metadata_")(
+        validate_max_metadata_length
     )
+
+    _validate_artifact_format = field_validator("key")(validate_artifact_key)
 
 
 class ArtifactUpdate(ActionBaseModel):
@@ -987,7 +1008,7 @@ class ArtifactUpdate(ActionBaseModel):
     description: Optional[str] = Field(None)
     metadata_: Optional[Dict[str, str]] = Field(None)
 
-    _validate_metadata_length = validator("metadata_", allow_reuse=True)(
+    _validate_metadata_length = field_validator("metadata_")(
         validate_max_metadata_length
     )
 
@@ -999,13 +1020,12 @@ class VariableCreate(ActionBaseModel):
         default=...,
         description="The name of the variable",
         examples=["my-variable"],
-        max_length=schemas.core.MAX_VARIABLE_NAME_LENGTH,
+        max_length=MAX_VARIABLE_NAME_LENGTH,
     )
-    value: str = Field(
+    value: StrictVariableValue = Field(
         default=...,
         description="The value of the variable",
         examples=["my-value"],
-        max_length=schemas.core.MAX_VARIABLE_VALUE_LENGTH,
     )
     tags: List[str] = Field(
         default_factory=list,
@@ -1014,7 +1034,7 @@ class VariableCreate(ActionBaseModel):
     )
 
     # validators
-    _validate_name_format = validator("name", allow_reuse=True)(validate_variable_name)
+    _validate_name_format = field_validator("name")(validate_variable_name)
 
 
 class VariableUpdate(ActionBaseModel):
@@ -1024,13 +1044,12 @@ class VariableUpdate(ActionBaseModel):
         default=None,
         description="The name of the variable",
         examples=["my-variable"],
-        max_length=schemas.core.MAX_VARIABLE_NAME_LENGTH,
+        max_length=MAX_VARIABLE_NAME_LENGTH,
     )
-    value: Optional[str] = Field(
+    value: StrictVariableValue = Field(
         default=None,
         description="The value of the variable",
         examples=["my-value"],
-        max_length=schemas.core.MAX_VARIABLE_VALUE_LENGTH,
     )
     tags: Optional[List[str]] = Field(
         default=None,
@@ -1039,4 +1058,4 @@ class VariableUpdate(ActionBaseModel):
     )
 
     # validators
-    _validate_name_format = validator("name", allow_reuse=True)(validate_variable_name)
+    _validate_name_format = field_validator("name")(validate_variable_name)

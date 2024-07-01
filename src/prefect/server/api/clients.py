@@ -3,29 +3,25 @@ from urllib.parse import quote
 from uuid import UUID
 
 import httpx
+import pydantic
 from httpx import Response
-from prefect._vendor.starlette import status
+from starlette import status
 from typing_extensions import Self
 
-from prefect._internal.pydantic import HAS_PYDANTIC_V2
+from prefect.client.base import PrefectHttpxAsyncClient
 from prefect.exceptions import ObjectNotFound
-from prefect.server.schemas.actions import DeploymentFlowRunCreate, StateCreate
-
-if HAS_PYDANTIC_V2:
-    import pydantic.v1 as pydantic
-else:
-    import pydantic
-
-from prefect.client.base import PrefectHttpxClient
 from prefect.logging import get_logger
+from prefect.server.schemas.actions import DeploymentFlowRunCreate, StateCreate
+from prefect.server.schemas.core import WorkPool
 from prefect.server.schemas.filters import VariableFilter, VariableFilterName
-from prefect.server.schemas.responses import DeploymentResponse, WorkPoolResponse
+from prefect.server.schemas.responses import DeploymentResponse
+from prefect.types import StrictVariableValue
 
 logger = get_logger(__name__)
 
 
 class BaseClient:
-    _http_client: PrefectHttpxClient
+    _http_client: PrefectHttpxAsyncClient
 
     def __init__(self, additional_headers: Dict[str, str] = {}):
         from prefect.server.api.server import create_app
@@ -34,7 +30,7 @@ class BaseClient:
         # will point it to the the currently running server instance
         api_app = create_app()
 
-        self._http_client = PrefectHttpxClient(
+        self._http_client = PrefectHttpxAsyncClient(
             transport=httpx.ASGITransport(app=api_app, raise_app_exceptions=False),
             headers={**additional_headers},
             base_url="http://prefect-in-memory/api",
@@ -64,7 +60,7 @@ class OrchestrationClient(BaseClient):
             if e.response.status_code == status.HTTP_404_NOT_FOUND:
                 return None
             raise
-        return DeploymentResponse.parse_obj(response.json())
+        return DeploymentResponse.model_validate(response.json())
 
     async def read_flow_raw(self, flow_id: UUID) -> Response:
         return await self._http_client.get(f"/flows/{flow_id}")
@@ -74,7 +70,7 @@ class OrchestrationClient(BaseClient):
     ) -> Response:
         return await self._http_client.post(
             f"/deployments/{deployment_id}/create_flow_run",
-            json=flow_run_create.dict(json_compatible=True),
+            json=flow_run_create.model_dump(mode="json"),
         )
 
     async def read_flow_run_raw(self, flow_run_id: UUID) -> Response:
@@ -99,7 +95,7 @@ class OrchestrationClient(BaseClient):
         return await self._http_client.post(
             f"/flow_runs/{flow_run_id}/set_state",
             json={
-                "state": state.dict(json_compatible=True),
+                "state": state.model_dump(mode="json"),
                 "force": False,
             },
         )
@@ -120,11 +116,11 @@ class OrchestrationClient(BaseClient):
             json={"work_pools": {"id": {"any_": [str(work_pool_id)]}}},
         )
 
-    async def read_work_pool(self, work_pool_id: UUID) -> Optional[WorkPoolResponse]:
+    async def read_work_pool(self, work_pool_id: UUID) -> Optional[WorkPool]:
         response = await self.read_work_pool_raw(work_pool_id)
         response.raise_for_status()
 
-        pools = pydantic.parse_obj_as(List[WorkPoolResponse], response.json())
+        pools = pydantic.TypeAdapter(List[WorkPool]).validate_python(response.json())
         return pools[0] if pools else None
 
     async def read_work_queue_raw(self, work_queue_id: UUID) -> Response:
@@ -160,8 +156,8 @@ class OrchestrationClient(BaseClient):
 
     async def read_workspace_variables(
         self, names: Optional[List[str]] = None
-    ) -> Dict[str, str]:
-        variables: Dict[str, str] = {}
+    ) -> Dict[str, StrictVariableValue]:
+        variables: Dict[str, StrictVariableValue] = {}
 
         offset = 0
 
@@ -178,7 +174,7 @@ class OrchestrationClient(BaseClient):
             response = await self._http_client.post(
                 "/variables/filter",
                 json={
-                    "variables": filter.dict(),
+                    "variables": filter.model_dump(),
                     "limit": self.VARIABLE_PAGE_SIZE,
                     "offset": offset,
                 },
@@ -207,7 +203,7 @@ class WorkPoolsOrchestrationClient(BaseClient):
     async def __aenter__(self) -> Self:
         return self
 
-    async def read_work_pool(self, work_pool_name: str) -> WorkPoolResponse:
+    async def read_work_pool(self, work_pool_name: str) -> WorkPool:
         """
         Reads information for a given work pool
         Args:
@@ -219,7 +215,7 @@ class WorkPoolsOrchestrationClient(BaseClient):
         try:
             response = await self._http_client.get(f"/work_pools/{work_pool_name}")
             response.raise_for_status()
-            return pydantic.parse_obj_as(WorkPoolResponse, response.json())
+            return WorkPool.model_validate(response.json())
         except httpx.HTTPStatusError as e:
             if e.response.status_code == status.HTTP_404_NOT_FOUND:
                 raise ObjectNotFound(http_exc=e) from e

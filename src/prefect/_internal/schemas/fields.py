@@ -1,30 +1,7 @@
-import datetime
 from typing import Optional
 from uuid import UUID
 
-import pendulum
-
-from prefect._internal.pydantic import HAS_PYDANTIC_V2
-
-if HAS_PYDANTIC_V2:
-    from pydantic.v1 import BaseModel, Field
-else:
-    from pydantic import BaseModel, Field
-
-
-class DateTimeTZ(pendulum.DateTime):
-    @classmethod
-    def __get_validators__(cls):
-        yield cls.validate
-
-    @classmethod
-    def validate(cls, v):
-        if isinstance(v, str):
-            return pendulum.parse(v)
-        elif isinstance(v, datetime.datetime):
-            return pendulum.instance(v)
-        else:
-            raise ValueError("Unrecognized datetime.")
+from pydantic import BaseModel, Field
 
 
 class CreatedBy(BaseModel):

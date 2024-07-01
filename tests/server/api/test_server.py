@@ -6,8 +6,8 @@ import asyncpg
 import pytest
 import sqlalchemy as sa
 import toml
+from fastapi import APIRouter, status, testclient
 from httpx import ASGITransport, AsyncClient
-from prefect._vendor.fastapi import APIRouter, status, testclient
 
 from prefect.client.constants import SERVER_API_VERSION
 from prefect.server.api.server import (
@@ -34,9 +34,10 @@ async def test_validation_error_handler_422(client):
     assert response.json()["exception_message"] == "Invalid request received."
     assert response.json()["exception_detail"] == [
         {
+            "input": "this should be a list not a string",
             "loc": ["body", "tags"],
-            "msg": "value is not a valid list",
-            "type": "type_error.list",
+            "msg": "Input should be a valid list",
+            "type": "list_type",
         }
     ]
     assert response.json()["request_body"] == bad_flow_data
@@ -47,7 +48,6 @@ async def test_validation_error_handler_409(client):
     bad_deployment_data = {
         "name": "my-deployment",
         "flow_id": str(uuid4()),
-        "manifest_path": "file.json",
     }
     response = await client.post("/deployments/", json=bad_deployment_data)
     assert response.status_code == status.HTTP_409_CONFLICT

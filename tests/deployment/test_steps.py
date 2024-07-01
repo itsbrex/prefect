@@ -4,6 +4,7 @@ import sys
 import warnings
 from pathlib import Path
 from textwrap import dedent
+from typing import Optional
 from unittest.mock import ANY, call
 
 import pytest
@@ -16,6 +17,7 @@ from prefect.deployments.steps import run_step
 from prefect.deployments.steps.core import StepExecutionError, run_steps
 from prefect.deployments.steps.utility import run_shell_script
 from prefect.testing.utilities import AsyncMock, MagicMock
+from prefect.utilities.filesystem import tmpchdir
 
 
 @pytest.fixture
@@ -148,6 +150,41 @@ class TestRunStep:
         )  # once before and once after installation
         subprocess.check_call.assert_called_once_with(
             [sys.executable, "-m", "pip", "install", "test-package>=1.0.0"]
+        )
+
+    @pytest.mark.parametrize(
+        "package,expected",
+        [
+            ("prefect-aws", "prefect[aws]"),
+            ("prefect-gcp", "prefect[gcp]"),
+            ("prefect-azure", "prefect[azure]"),
+            ("prefect-docker", "prefect[docker]"),
+            ("prefect-kubernetes", "prefect[kubernetes]"),
+        ],
+    )
+    async def test_requirement_installation_uses_prefect_extras(
+        self, monkeypatch, package, expected
+    ):
+        import_module_mock = MagicMock()
+        monkeypatch.setattr(
+            "prefect.deployments.steps.core.import_module", import_module_mock
+        )
+
+        monkeypatch.setattr(subprocess, "check_call", MagicMock())
+
+        import_object_mock = MagicMock(side_effect=[ImportError, lambda x: x])
+        monkeypatch.setattr(
+            "prefect.deployments.steps.core.import_object", import_object_mock
+        )
+
+        await run_step({"test_module.test_function": {"requires": package, "x": 1}})
+
+        import_module_mock.assert_called_once_with(package.replace("-", "_"))
+        assert (
+            import_object_mock.call_count == 2
+        )  # once before and once after installation
+        subprocess.check_call.assert_called_once_with(
+            [sys.executable, "-m", "pip", "install", expected]
         )
 
     async def test_install_multiple_requirements(self, monkeypatch):
@@ -346,7 +383,9 @@ class TestRunSteps:
 
 
 class MockCredentials:
-    def __init__(self, token: str, username: str = None, password: str = None):
+    def __init__(
+        self, token: str, username: Optional[str] = None, password: Optional[str] = None
+    ):
         self.token = token
         self.username = username
         self.password = password
@@ -712,7 +751,7 @@ class TestPipInstallRequirements:
         )
 
     async def test_pip_install_reqs_with_directory_step_output_succeeds(
-        self, monkeypatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ):
         open_process_mock = MagicMock(return_value=MockProcess(0))
         monkeypatch.setattr(
@@ -753,7 +792,8 @@ class TestPipInstallRequirements:
 
         open_process_mock.run.return_value = MagicMock(**step_outputs)
 
-        output = await run_steps(steps)
+        with tmpchdir(tmp_path):
+            output = await run_steps(steps)
 
         assert output == step_outputs
 
@@ -790,7 +830,9 @@ class TestPipInstallRequirements:
 
 class TestPullWithBlock:
     @pytest.fixture
-    async def test_block(self):
+    async def test_block(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(str(tmp_path))  # ensures never writes to active directory
+
         class FakeStorageBlock(Block):
             _block_type_slug = "fake-storage-block"
 
@@ -866,7 +908,7 @@ class TestPullWithBlock:
         """
 
         class Wrong(Block):
-            square_peg = "round_hole"
+            square_peg: str = "round_hole"
 
         block = Wrong()
         await block.save("test-block")

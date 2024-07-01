@@ -12,15 +12,15 @@ def _emit_concurrency_event(
     slots: int,
     follows: Union[Event, None] = None,
 ) -> Union[Event, None]:
-    resource = {
+    resource: Dict[str, str] = {
         "prefect.resource.id": f"prefect.concurrency-limit.{primary_limit.id}",
         "prefect.resource.name": primary_limit.name,
-        "slots-acquired": slots,
-        "limit": primary_limit.limit,
+        "slots-acquired": str(slots),
+        "limit": str(primary_limit.limit),
     }
 
     related = [
-        RelatedResource.parse_obj(
+        RelatedResource.model_validate(
             {
                 "prefect.resource.id": f"prefect.concurrency-limit.{limit.id}",
                 "prefect.resource.role": "concurrency-limit",

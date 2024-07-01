@@ -1,13 +1,9 @@
 import asyncio
-
-from prefect._internal.pydantic import HAS_PYDANTIC_V2
-
-if HAS_PYDANTIC_V2:
-    import pydantic.v1 as pydantic
-else:
-    import pydantic
+from uuid import UUID
 
 import pytest
+from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from prefect.server.database.interface import PrefectDBInterface
@@ -23,7 +19,10 @@ from prefect.server.models.concurrency_limits_v2 import (
     read_concurrency_limit,
     update_concurrency_limit,
 )
-from prefect.server.schemas.actions import ConcurrencyLimitV2Update
+from prefect.server.schemas.actions import (
+    ConcurrencyLimitV2Create,
+    ConcurrencyLimitV2Update,
+)
 from prefect.server.schemas.core import ConcurrencyLimitV2
 
 
@@ -40,7 +39,7 @@ async def concurrency_limit(session: AsyncSession) -> ConcurrencyLimitV2:
 
     await session.commit()
 
-    return ConcurrencyLimitV2.from_orm(concurrency_limit)
+    return ConcurrencyLimitV2.model_validate(concurrency_limit, from_attributes=True)
 
 
 @pytest.fixture
@@ -56,7 +55,7 @@ async def concurrency_limit_with_decay(session: AsyncSession) -> ConcurrencyLimi
 
     await session.commit()
 
-    return ConcurrencyLimitV2.from_orm(concurrency_limit)
+    return ConcurrencyLimitV2.model_validate(concurrency_limit, from_attributes=True)
 
 
 @pytest.fixture
@@ -72,7 +71,7 @@ async def locked_concurrency_limit(session: AsyncSession) -> ConcurrencyLimitV2:
 
     await session.commit()
 
-    return ConcurrencyLimitV2.from_orm(concurrency_limit)
+    return ConcurrencyLimitV2.model_validate(concurrency_limit, from_attributes=True)
 
 
 async def test_create_concurrency_limit(session: AsyncSession):
@@ -92,11 +91,8 @@ async def test_create_concurrency_limit(session: AsyncSession):
     assert concurrency_limit.slot_decay_per_second == 0.5
 
 
-async def test_concurrency_limit_with_invalid_name_raises(session: AsyncSession):
-    with pytest.raises(
-        pydantic.error_wrappers.ValidationError,
-        match="contains an invalid character",
-    ):
+async def test_create_concurrency_limit_with_invalid_name_raises(session: AsyncSession):
+    with pytest.raises(ValidationError, match="String should match pattern"):
         await create_concurrency_limit(
             session=session,
             concurrency_limit=ConcurrencyLimitV2(
@@ -104,6 +100,55 @@ async def test_concurrency_limit_with_invalid_name_raises(session: AsyncSession)
                 limit=10,
                 slot_decay_per_second=0.5,
             ),
+        )
+
+
+async def test_create_concurrency_limit_with_invalid_limit_raises(
+    session: AsyncSession,
+):
+    with pytest.raises(
+        ValidationError,
+        match=" Input should be greater than or equal to 0",
+    ):
+        await create_concurrency_limit(
+            session=session,
+            concurrency_limit=ConcurrencyLimitV2Create(
+                name="test_limit",
+                limit=-2,
+                slot_decay_per_second=0.5,
+            ),
+        )
+
+
+async def test_create_concurrency_limit_with_invalid_slot_decay_raises(
+    session: AsyncSession,
+):
+    with pytest.raises(
+        ValidationError,
+        match=" Input should be greater than or equal to 0",
+    ):
+        await create_concurrency_limit(
+            session=session,
+            concurrency_limit=ConcurrencyLimitV2Create(
+                name="test_limit",
+                limit=10,
+                slot_decay_per_second=-1,
+            ),
+        )
+
+
+async def test_create_concurrency_limit_with_duplicate_name_raises(
+    session: AsyncSession,
+):
+    await create_concurrency_limit(
+        session=session,
+        concurrency_limit=ConcurrencyLimitV2(name="test_limit", limit=10),
+    )
+
+    with pytest.raises(IntegrityError):
+        await create_concurrency_limit(
+            session=session,
+            concurrency_limit=ConcurrencyLimitV2(name="test_limit", limit=10),
         )
 
 
@@ -179,6 +224,16 @@ async def test_update_concurrency_limit_by_id(
     assert refreshed.name == "new-name"
 
 
+async def test_update_concurrency_limit_with_id_not_found(
+    session: AsyncSession,
+):
+    assert not await update_concurrency_limit(
+        session=session,
+        concurrency_limit=ConcurrencyLimitV2Update(),
+        concurrency_limit_id=UUID("00000000-0000-0000-0000-000000000000"),
+    ), "Concurrency limit with id 9999 should not be found"
+
+
 async def test_update_concurrency_limit_by_name(
     concurrency_limit: ConcurrencyLimitV2, session: AsyncSession
 ):
@@ -197,6 +252,14 @@ async def test_update_concurrency_limit_by_name(
     assert refreshed.name == "new-name"
 
 
+async def test_update_concurrency_limit_with_name_not_found(
+    session: AsyncSession,
+):
+    assert not await update_concurrency_limit(
+        session=session, concurrency_limit=ConcurrencyLimitV2Update(), name="not-found"
+    ), "Concurrency limit with name 'not-found' should not be found"
+
+
 async def test_delete_concurrency_limit_by_id(
     concurrency_limit: ConcurrencyLimitV2, session: AsyncSession
 ):
@@ -206,6 +269,45 @@ async def test_delete_concurrency_limit_by_id(
     assert not await read_concurrency_limit(
         session, concurrency_limit_id=concurrency_limit.id
     )
+
+
+async def test_update_concurrency_limit_with_invalid_name_raises(
+    concurrency_limit: ConcurrencyLimitV2, session: AsyncSession
+):
+    with pytest.raises(ValidationError, match="String should match pattern"):
+        await update_concurrency_limit(
+            session=session,
+            concurrency_limit=ConcurrencyLimitV2Update(name="test_limit & 0 < 1"),
+            concurrency_limit_id=concurrency_limit.id,
+        )
+
+
+async def test_update_concurrency_limit_with_invalid_limit_raises(
+    concurrency_limit: ConcurrencyLimitV2, session: AsyncSession
+):
+    with pytest.raises(
+        ValidationError,
+        match=" Input should be greater than or equal to 0",
+    ):
+        await update_concurrency_limit(
+            session=session,
+            concurrency_limit=ConcurrencyLimitV2Update(limit=-2),
+            concurrency_limit_id=concurrency_limit.id,
+        )
+
+
+async def test_update_concurrency_limit_with_invalid_slot_decay_raises(
+    concurrency_limit: ConcurrencyLimitV2, session: AsyncSession
+):
+    with pytest.raises(
+        ValidationError,
+        match=" Input should be greater than or equal to 0",
+    ):
+        await update_concurrency_limit(
+            session=session,
+            concurrency_limit=ConcurrencyLimitV2Update(slot_decay_per_second=-1),
+            concurrency_limit_id=concurrency_limit.id,
+        )
 
 
 async def test_delete_concurrency_limit_by_name(

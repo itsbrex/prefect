@@ -1,27 +1,6 @@
-from prefect.infrastructure.base import Infrastructure, InfrastructureResult
-from prefect.infrastructure.container import DockerContainer, DockerContainerResult
-from prefect.infrastructure.kubernetes import (
-    KubernetesClusterConfig,
-    KubernetesImagePullPolicy,
-    KubernetesJob,
-    KubernetesJobResult,
-    KubernetesManifest,
-    KubernetesRestartPolicy,
-)
-from prefect.infrastructure.process import Process, ProcessResult
+"""
+2024-06-27: This surfaces an actionable error message for moved or removed objects in Prefect 3.0 upgrade.
+"""
+from prefect._internal.compatibility.migration import getattr_migration
 
-# Declare API
-__all__ = [
-    "DockerContainer",
-    "DockerContainerResult",
-    "Infrastructure",
-    "InfrastructureResult",
-    "KubernetesClusterConfig",
-    "KubernetesImagePullPolicy",
-    "KubernetesJob",
-    "KubernetesJobResult",
-    "KubernetesManifest",
-    "KubernetesRestartPolicy",
-    "Process",
-    "ProcessResult",
-]
+__getattr__ = getattr_migration(__name__)

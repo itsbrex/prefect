@@ -1,18 +1,10 @@
 from uuid import uuid4
 
 import pendulum
-
-from prefect._internal.pydantic import HAS_PYDANTIC_V2
-
-if HAS_PYDANTIC_V2:
-    import pydantic.v1 as pydantic
-else:
-    import pydantic
-
+import pydantic
 import pytest
 import sqlalchemy as sa
 
-import prefect
 from prefect.server import models, schemas
 
 
@@ -48,7 +40,9 @@ class TestCreateWorkPool:
 
     @pytest.mark.parametrize("name", ["hi/there", "hi%there"])
     async def test_create_invalid_name(self, session, name):
-        with pytest.raises(pydantic.ValidationError, match="(invalid character)"):
+        with pytest.raises(
+            pydantic.ValidationError, match="String should match pattern"
+        ):
             schemas.core.WorkPool(name=name)
 
     @pytest.mark.parametrize("type", ["PROCESS", "K8S", "AGENT"])
@@ -153,6 +147,7 @@ class TestUpdateWorkPool:
             work_pool=schemas.actions.WorkPoolUpdate(
                 is_paused=True, concurrency_limit=5
             ),
+            emit_status_change=None,
         )
 
         result = await models.workers.read_work_pool(
@@ -167,6 +162,7 @@ class TestUpdateWorkPool:
                 session=session,
                 work_pool_id=work_pool.id,
                 work_pool=schemas.actions.WorkPoolUpdate(concurrency_limit=-5),
+                emit_status_change=None,
             )
 
     async def test_update_work_pool_zero_concurrency(self, session, work_pool):
@@ -174,6 +170,7 @@ class TestUpdateWorkPool:
             session=session,
             work_pool_id=work_pool.id,
             work_pool=schemas.actions.WorkPoolUpdate(concurrency_limit=0),
+            emit_status_change=None,
         )
         result = await models.workers.read_work_pool(
             session=session, work_pool_id=work_pool.id
@@ -303,7 +300,9 @@ class TestCreateWorkQueue:
 
     @pytest.mark.parametrize("name", ["hi/there", "hi%there"])
     async def test_create_invalid_name(self, session, work_pool, name):
-        with pytest.raises(pydantic.ValidationError, match="(invalid character)"):
+        with pytest.raises(
+            pydantic.ValidationError, match="String should match pattern"
+        ):
             schemas.actions.WorkQueueCreate(name=name)
 
 
@@ -723,7 +722,7 @@ class TestGetScheduledRuns:
                 session=session,
                 flow_run=schemas.core.FlowRun(
                     flow_id=flow.id,
-                    state=prefect.states.Running(),
+                    state=schemas.states.Running(),
                     work_queue_id=wq.id,
                 ),
             )
@@ -733,7 +732,7 @@ class TestGetScheduledRuns:
                 session=session,
                 flow_run=schemas.core.FlowRun(
                     flow_id=flow.id,
-                    state=prefect.states.Pending(),
+                    state=schemas.states.Pending(),
                     work_queue_id=wq.id,
                 ),
             )
@@ -746,7 +745,7 @@ class TestGetScheduledRuns:
                     session=session,
                     flow_run=schemas.core.FlowRun(
                         flow_id=flow.id,
-                        state=prefect.states.Scheduled(
+                        state=schemas.states.Scheduled(
                             scheduled_time=pendulum.now("UTC").add(hours=i)
                         ),
                         work_queue_id=wq.id,

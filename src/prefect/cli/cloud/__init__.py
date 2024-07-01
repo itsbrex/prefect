@@ -15,10 +15,9 @@ import httpx
 import readchar
 import typer
 import uvicorn
-from prefect._vendor.fastapi import FastAPI
-from prefect._vendor.fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-from prefect._internal.pydantic import HAS_PYDANTIC_V2
 
 from rich.live import Live
 from rich.table import Table
@@ -44,17 +43,14 @@ from prefect.utilities.asyncutils import run_sync_in_worker_thread
 from prefect.utilities.collections import listrepr
 from prefect.utilities.compat import raise_signal
 
-if HAS_PYDANTIC_V2:
-    from pydantic.v1 import BaseModel
-else:
-    from pydantic import BaseModel
+from pydantic import BaseModel
 
 # Set up the `prefect cloud` and `prefect cloud workspaces` CLI applications
 cloud_app = PrefectTyper(
-    name="cloud", help="Commands for interacting with Prefect Cloud"
+    name="cloud", help="Authenticate and interact with Prefect Cloud"
 )
 workspace_app = PrefectTyper(
-    name="workspace", help="Commands for interacting with Prefect Cloud Workspaces"
+    name="workspace", help="View and set Prefect Cloud Workspaces"
 )
 cloud_app.add_typer(workspace_app, aliases=["workspaces"])
 app.add_typer(cloud_app)
@@ -130,9 +126,6 @@ async def serve_login_api(cancel_scope, task_status):
         app.console.print("[red][bold]X Error starting login service!")
         cause = exc.__context__  # Hide the system exit
         traceback.print_exception(type(cause), value=cause, tb=cause.__traceback__)
-        cancel_scope.cancel()
-    except KeyboardInterrupt:
-        # `uvicorn.serve` can raise `KeyboardInterrupt` when it's done serving.
         cancel_scope.cancel()
     else:
         # Exit if we are done serving the API
@@ -274,9 +267,8 @@ async def login_with_browser() -> str:
             app.console.print("Waiting for response...")
             await result_event.wait()
 
-        # Uvicorn installs signal handlers, this is the cleanest way to shutdown the
-        # login API
-        raise_signal(signal.SIGINT)
+        # Shut down the background uvicorn server
+        tg.cancel_scope.cancel()
 
     result = login_api.extra.get("result")
     if not result:
@@ -374,6 +366,7 @@ async def login(
     profiles = load_profiles()
     current_profile = get_settings_context().profile
     env_var_api_key = PREFECT_API_KEY.value()
+    selected_workspace = None
 
     if env_var_api_key and key and env_var_api_key != key:
         exit_with_error(
@@ -483,6 +476,7 @@ async def login(
         # Search for the given workspace
         for workspace in workspaces:
             if workspace.handle == workspace_handle:
+                selected_workspace = workspace
                 break
         else:
             if workspaces:
@@ -516,7 +510,8 @@ async def login(
             )
         if selected_workspace is None:
             exit_with_error("No workspace selected.")
-    else:
+
+    elif not selected_workspace and not workspace_handle:
         if current_workspace:
             selected_workspace = current_workspace
         elif len(workspaces) > 0:
@@ -577,7 +572,7 @@ async def open():
         )
 
     current_workspace = get_current_workspace(
-        await prefect.get_cloud_client().read_workspaces()
+        await prefect.client.cloud.get_cloud_client().read_workspaces()
     )
     if current_workspace is None:
         exit_with_error(

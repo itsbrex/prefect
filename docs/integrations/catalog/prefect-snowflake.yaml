@@ -1,6 +1,6 @@
-collectionName: prefect-snowflake
+integrationName: prefect-snowflake
 author: Prefect
 authorUrl: https://prefect.io
-documentation: https://prefecthq.github.io/prefect-snowflake/
-iconUrl: /img/collections/snowflake.png
+documentation: prefect-snowflake
+iconUrl: /images/integrations/snowflake.png
 tag: Snowflake

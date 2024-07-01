@@ -1,6 +1,6 @@
-collectionName: prefect-gcp
+integrationName: prefect-gcp
 author: Prefect
 authorUrl: https://prefect.io
-documentation: https://prefecthq.github.io/prefect-gcp/
-iconUrl: /img/collections/gcp.png
+documentation: prefect-gcp
+iconUrl: /images/integrations/gcp.png
 tag: GCP

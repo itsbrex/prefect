@@ -8,18 +8,24 @@ from uuid import UUID
 
 import jsonschema.exceptions
 import pendulum
-from prefect._vendor.fastapi import Body, Depends, HTTPException, Path, Response, status
+from fastapi import Body, Depends, HTTPException, Path, Response, status
+from pydantic_extra_types.pendulum_dt import DateTime
+from starlette.background import BackgroundTasks
 
 import prefect.server.api.dependencies as dependencies
 import prefect.server.models as models
 import prefect.server.schemas as schemas
-from prefect.server.api.validation import validate_job_variables_for_flow_run
+from prefect.server.api.validation import (
+    validate_job_variables_for_deployment,
+    validate_job_variables_for_deployment_flow_run,
+)
 from prefect.server.api.workers import WorkerLookups
 from prefect.server.database.dependencies import provide_database_interface
 from prefect.server.database.interface import PrefectDBInterface
 from prefect.server.exceptions import MissingVariableError, ObjectNotFoundError
+from prefect.server.models.deployments import mark_deployments_ready
 from prefect.server.models.workers import DEFAULT_AGENT_WORK_POOL_NAME
-from prefect.server.utilities.schemas import DateTimeTZ
+from prefect.server.schemas.responses import DeploymentPaginationResponse
 from prefect.server.utilities.server import PrefectRouter
 from prefect.utilities.schema_tools.hydration import (
     HydrationContext,
@@ -64,9 +70,9 @@ async def create_deployment(
     When upserting, any scheduled runs from the existing deployment will be deleted.
     """
 
-    data = deployment.dict(exclude_unset=True)
-    data["created_by"] = created_by.dict() if created_by else None
-    data["updated_by"] = updated_by.dict() if created_by else None
+    data = deployment.model_dump(exclude_unset=True)
+    data["created_by"] = created_by.model_dump() if created_by else None
+    data["updated_by"] = updated_by.model_dump() if created_by else None
 
     async with db.session_context(begin_transaction=True) as session:
         if (
@@ -82,16 +88,15 @@ async def create_deployment(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f'Work pool "{deployment.work_pool_name}" not found.',
                 )
-            try:
-                deployment.check_valid_configuration(work_pool.base_job_template)
-            except (MissingVariableError, jsonschema.exceptions.ValidationError) as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Error creating deployment: {exc!r}",
-                )
+
+            await validate_job_variables_for_deployment(
+                session,
+                work_pool,
+                deployment,
+            )
 
         # hydrate the input model into a full model
-        deployment_dict = deployment.dict(exclude={"work_pool_name"})
+        deployment_dict = deployment.model_dump(exclude={"work_pool_name"})
         if deployment.work_pool_name and deployment.work_queue_name:
             # If a specific pool name/queue name combination was provided, get the
             # ID for that work pool queue.
@@ -115,7 +120,7 @@ async def create_deployment(
         elif deployment.work_queue_name:
             # If just a queue name was provided, ensure that the queue exists and
             # get its ID.
-            work_queue = await models.work_queues._ensure_work_queue_exists(
+            work_queue = await models.work_queues.ensure_work_queue_exists(
                 session=session, name=deployment.work_queue_name
             )
             deployment_dict["work_queue_id"] = work_queue.id
@@ -142,13 +147,11 @@ async def create_deployment(
                 )
 
         if deployment.storage_document_id is not None:
-            infrastructure_block = (
-                await models.block_documents.read_block_document_by_id(
-                    session=session,
-                    block_document_id=deployment.storage_document_id,
-                )
+            storage_block = await models.block_documents.read_block_document_by_id(
+                session=session,
+                block_document_id=deployment.storage_document_id,
             )
-            if not infrastructure_block:
+            if not storage_block:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=(
@@ -173,7 +176,9 @@ async def create_deployment(
         if model.created >= now:
             response.status_code = status.HTTP_201_CREATED
 
-        return schemas.responses.DeploymentResponse.from_orm(model)
+        return schemas.responses.DeploymentResponse.model_validate(
+            model, from_attributes=True
+        )
 
 
 @router.patch("/{id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -197,7 +202,7 @@ async def update_deployment(
         # This is support for legacy clients that don't know about the
         # `schedules` field.
 
-        update_data = deployment.dict(exclude_unset=True)
+        update_data = deployment.model_dump(exclude_unset=True)
 
         if "schedule" in update_data or "is_schedule_active" in update_data:
             if len(existing_deployment.schedules) > 1:
@@ -248,6 +253,8 @@ async def update_deployment(
                 ctx = await HydrationContext.build(
                     session=session,
                     raise_on_error=True,
+                    render_jinja=True,
+                    render_workspace_variables=True,
                 )
                 parameters = hydrate(dehydrated_params, ctx)
                 deployment.parameters = parameters
@@ -317,7 +324,9 @@ async def read_deployment_by_name(
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, detail="Deployment not found"
             )
-        return schemas.responses.DeploymentResponse.from_orm(deployment)
+        return schemas.responses.DeploymentResponse.model_validate(
+            deployment, from_attributes=True
+        )
 
 
 @router.get("/{id}")
@@ -336,7 +345,9 @@ async def read_deployment(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Deployment not found"
             )
-        return schemas.responses.DeploymentResponse.from_orm(deployment)
+        return schemas.responses.DeploymentResponse.model_validate(
+            deployment, from_attributes=True
+        )
 
 
 @router.post("/filter")
@@ -371,17 +382,80 @@ async def read_deployments(
             work_queue_filter=work_pool_queues,
         )
         return [
-            schemas.responses.DeploymentResponse.from_orm(orm_deployment=deployment)
+            schemas.responses.DeploymentResponse.model_validate(
+                deployment, from_attributes=True
+            )
             for deployment in response
         ]
 
 
+@router.post("/paginate")
+async def paginate_deployments(
+    limit: int = dependencies.LimitBody(),
+    page: int = Body(1, ge=1),
+    flows: schemas.filters.FlowFilter = None,
+    flow_runs: schemas.filters.FlowRunFilter = None,
+    task_runs: schemas.filters.TaskRunFilter = None,
+    deployments: schemas.filters.DeploymentFilter = None,
+    work_pools: schemas.filters.WorkPoolFilter = None,
+    work_pool_queues: schemas.filters.WorkQueueFilter = None,
+    sort: schemas.sorting.DeploymentSort = Body(
+        schemas.sorting.DeploymentSort.NAME_ASC
+    ),
+    db: PrefectDBInterface = Depends(provide_database_interface),
+) -> DeploymentPaginationResponse:
+    """
+    Pagination query for flow runs.
+    """
+    offset = (page - 1) * limit
+
+    async with db.session_context() as session:
+        response = await models.deployments.read_deployments(
+            session=session,
+            offset=offset,
+            sort=sort,
+            limit=limit,
+            flow_filter=flows,
+            flow_run_filter=flow_runs,
+            task_run_filter=task_runs,
+            deployment_filter=deployments,
+            work_pool_filter=work_pools,
+            work_queue_filter=work_pool_queues,
+        )
+
+        count = await models.deployments.count_deployments(
+            session=session,
+            flow_filter=flows,
+            flow_run_filter=flow_runs,
+            task_run_filter=task_runs,
+            deployment_filter=deployments,
+            work_pool_filter=work_pools,
+            work_queue_filter=work_pool_queues,
+        )
+
+    results = [
+        schemas.responses.DeploymentResponse.model_validate(
+            deployment, from_attributes=True
+        )
+        for deployment in response
+    ]
+
+    return DeploymentPaginationResponse(
+        results=results,
+        count=count,
+        limit=limit,
+        pages=(count + limit - 1) // limit,
+        page=page,
+    )
+
+
 @router.post("/get_scheduled_flow_runs")
 async def get_scheduled_flow_runs_for_deployments(
+    background_tasks: BackgroundTasks,
     deployment_ids: List[UUID] = Body(
         default=..., description="The deployment IDs to get scheduled runs for"
     ),
-    scheduled_before: DateTimeTZ = Body(
+    scheduled_before: DateTime = Body(
         None, description="The maximum time to look for scheduled flow runs"
     ),
     limit: int = dependencies.LimitBody(),
@@ -411,16 +485,16 @@ async def get_scheduled_flow_runs_for_deployments(
         )
 
         flow_run_responses = [
-            schemas.responses.FlowRunResponse.from_orm(orm_flow_run=orm_flow_run)
+            schemas.responses.FlowRunResponse.model_validate(
+                orm_flow_run, from_attributes=True
+            )
             for orm_flow_run in orm_flow_runs
         ]
 
-    async with db.session_context(
-        begin_transaction=True, with_for_update=True
-    ) as session:
-        await models.deployments._update_deployment_last_polled(
-            session=session, deployment_ids=deployment_ids
-        )
+    background_tasks.add_task(
+        mark_deployments_ready,
+        deployment_ids=deployment_ids,
+    )
 
     return flow_run_responses
 
@@ -471,13 +545,16 @@ async def delete_deployment(
 @router.post("/{id}/schedule")
 async def schedule_deployment(
     deployment_id: UUID = Path(..., description="The deployment id", alias="id"),
-    start_time: DateTimeTZ = Body(None, description="The earliest date to schedule"),
-    end_time: DateTimeTZ = Body(None, description="The latest date to schedule"),
-    min_time: datetime.timedelta = Body(
+    start_time: DateTime = Body(None, description="The earliest date to schedule"),
+    end_time: DateTime = Body(None, description="The latest date to schedule"),
+    # Workaround for the fact that FastAPI does not let us configure ser_json_timedelta
+    # to represent timedeltas as floats in JSON.
+    min_time: float = Body(
         None,
         description=(
             "Runs will be scheduled until at least this long after the `start_time`"
         ),
+        json_schema_extra={"format": "time-delta"},
     ),
     min_runs: int = Body(None, description="The minimum number of runs to schedule"),
     max_runs: int = Body(None, description="The maximum number of runs to schedule"),
@@ -496,6 +573,9 @@ async def schedule_deployment(
         - At least `min_runs` runs will be generated
         - Runs will be generated until at least `start_time + min_time` is reached
     """
+    if isinstance(min_time, float):
+        min_time = datetime.timedelta(seconds=min_time)
+
     async with db.session_context(begin_transaction=True) as session:
         await models.deployments.schedule_runs(
             session=session,
@@ -616,7 +696,12 @@ async def create_flow_run_from_deployment(
         try:
             dehydrated_params = deployment.parameters
             dehydrated_params.update(flow_run.parameters or {})
-            ctx = await HydrationContext.build(session=session, raise_on_error=True)
+            ctx = await HydrationContext.build(
+                session=session,
+                raise_on_error=True,
+                render_jinja=True,
+                render_workspace_variables=True,
+            )
             parameters = hydrate(dehydrated_params, ctx)
         except HydrationError as exc:
             raise HTTPException(
@@ -649,7 +734,9 @@ async def create_flow_run_from_deployment(
                     detail="Invalid schema: Unable to validate schema with circular references.",
                 )
 
-        await validate_job_variables_for_flow_run(flow_run, deployment, session)
+        await validate_job_variables_for_deployment_flow_run(
+            session, deployment, flow_run
+        )
 
         work_queue_name = deployment.work_queue_name
         work_queue_id = deployment.work_queue_id
@@ -666,7 +753,7 @@ async def create_flow_run_from_deployment(
 
         # hydrate the input model into a full flow run / state model
         flow_run = schemas.core.FlowRun(
-            **flow_run.dict(
+            **flow_run.model_dump(
                 exclude={
                     "parameters",
                     "tags",
@@ -697,7 +784,9 @@ async def create_flow_run_from_deployment(
         )
         if model.created >= now:
             response.status_code = status.HTTP_201_CREATED
-        return schemas.responses.FlowRunResponse.from_orm(model)
+        return schemas.responses.FlowRunResponse.model_validate(
+            model, from_attributes=True
+        )
 
 
 # DEPRECATED

@@ -41,23 +41,26 @@ from prefect.logging.configuration import setup_logging
 from prefect.settings import (
     PREFECT_API_BLOCKS_REGISTER_ON_START,
     PREFECT_API_DATABASE_CONNECTION_URL,
+    PREFECT_API_LOG_RETRYABLE_ERRORS,
     PREFECT_API_SERVICES_CANCELLATION_CLEANUP_ENABLED,
+    PREFECT_API_SERVICES_EVENT_PERSISTER_ENABLED,
     PREFECT_API_SERVICES_FLOW_RUN_NOTIFICATIONS_ENABLED,
+    PREFECT_API_SERVICES_FOREMAN_ENABLED,
     PREFECT_API_SERVICES_LATE_RUNS_ENABLED,
     PREFECT_API_SERVICES_PAUSE_EXPIRATIONS_ENABLED,
     PREFECT_API_SERVICES_SCHEDULER_ENABLED,
+    PREFECT_API_SERVICES_TRIGGERS_ENABLED,
     PREFECT_API_URL,
     PREFECT_ASYNC_FETCH_STATE_RESULT,
     PREFECT_CLI_COLORS,
     PREFECT_CLI_WRAP_LINES,
     PREFECT_EXPERIMENTAL_ENABLE_ENHANCED_CANCELLATION,
-    PREFECT_EXPERIMENTAL_ENABLE_WORKERS,
     PREFECT_EXPERIMENTAL_WARN_ENHANCED_CANCELLATION,
-    PREFECT_EXPERIMENTAL_WARN_WORKERS,
     PREFECT_HOME,
     PREFECT_LOCAL_STORAGE_PATH,
     PREFECT_LOGGING_INTERNAL_LEVEL,
     PREFECT_LOGGING_LEVEL,
+    PREFECT_LOGGING_SERVER_LEVEL,
     PREFECT_LOGGING_TO_API_ENABLED,
     PREFECT_MEMOIZE_BLOCK_AUTO_REGISTRATION,
     PREFECT_PROFILES_PATH,
@@ -213,18 +216,10 @@ def event_loop(request):
 
     When running on Windows we need to use a non-default loop for subprocess support.
     """
-    if sys.platform == "win32" and sys.version_info >= (3, 8):
+    if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
     policy = asyncio.get_event_loop_policy()
-
-    if sys.version_info < (3, 8) and sys.platform != "win32":
-        from prefect.utilities.compat import ThreadedChildWatcher
-
-        # Python < 3.8 does not use a `ThreadedChildWatcher` by default which can
-        # lead to errors in tests as the previous default `SafeChildWatcher`  is not
-        # compatible with threaded event loops.
-        policy.set_child_watcher(ThreadedChildWatcher())
 
     loop = policy.new_event_loop()
 
@@ -319,6 +314,7 @@ def pytest_sessionstart(session):
             # Enable debug logging
             PREFECT_LOGGING_LEVEL: "DEBUG",
             PREFECT_LOGGING_INTERNAL_LEVEL: "DEBUG",
+            PREFECT_LOGGING_SERVER_LEVEL: "DEBUG",
             # Disable shipping logs to the API;
             # can be enabled by the `enable_api_log_handler` mark
             PREFECT_LOGGING_TO_API_ENABLED: False,
@@ -329,12 +325,18 @@ def pytest_sessionstart(session):
             PREFECT_API_SERVICES_FLOW_RUN_NOTIFICATIONS_ENABLED: False,
             PREFECT_API_SERVICES_PAUSE_EXPIRATIONS_ENABLED: False,
             PREFECT_API_SERVICES_CANCELLATION_CLEANUP_ENABLED: False,
+            PREFECT_API_SERVICES_FOREMAN_ENABLED: False,
+            PREFECT_API_LOG_RETRYABLE_ERRORS: True,
             # Disable block auto-registration memoization
             PREFECT_MEMOIZE_BLOCK_AUTO_REGISTRATION: False,
             # Disable auto-registration of block types as they can conflict
             PREFECT_API_BLOCKS_REGISTER_ON_START: False,
             # Code is being executed in a unit test context
             PREFECT_UNIT_TEST_MODE: True,
+            # Events: disable the event persister and triggers service, which may
+            # lock the DB during tests while writing events
+            PREFECT_API_SERVICES_EVENT_PERSISTER_ENABLED: False,
+            PREFECT_API_SERVICES_TRIGGERS_ENABLED: False,
         },
         source=__file__,
     )
@@ -355,12 +357,15 @@ def pytest_sessionstart(session):
     setup_logging()
 
 
-@pytest.hookimpl(hookwrapper=True)
-def pytest_sessionfinish(session):
-    # Allow all other finish fixture to complete first
+# def pytest_sessionfinish(session, exitstatus):
+@pytest.fixture(scope="session", autouse=True)
+def cleanup(drain_log_workers, drain_events_workers):
+    # this fixture depends on other fixtures with important cleanup steps like
+    # draining workers to ensure that the home directory is not deleted before
+    # these steps are completed
     yield
 
-    # Then, delete the temporary directory
+    # delete the temporary directory
     if TEST_PREFECT_HOME is not None:
         shutil.rmtree(TEST_PREFECT_HOME)
 
@@ -476,17 +481,6 @@ def test_database_connection_url(generate_test_database_connection_url):
 
 
 @pytest.fixture(autouse=True)
-def reset_object_registry():
-    """
-    Ensures each test has a clean object registry.
-    """
-    from prefect.context import PrefectObjectRegistry
-
-    with PrefectObjectRegistry():
-        yield
-
-
-@pytest.fixture(autouse=True)
 def reset_registered_blocks():
     """
     Ensures each test only has types that were registered at module initialization.
@@ -520,22 +514,6 @@ def caplog(caplog):
 @pytest.fixture(autouse=True)
 def disable_csrf_protection():
     with temporary_settings({PREFECT_SERVER_CSRF_PROTECTION_ENABLED: False}):
-        yield
-
-
-@pytest.fixture
-def enable_workers():
-    with temporary_settings(
-        {PREFECT_EXPERIMENTAL_ENABLE_WORKERS: 1, PREFECT_EXPERIMENTAL_WARN_WORKERS: 0}
-    ):
-        yield
-
-
-@pytest.fixture
-def disable_workers():
-    with temporary_settings(
-        {PREFECT_EXPERIMENTAL_ENABLE_WORKERS: 0, PREFECT_EXPERIMENTAL_WARN_WORKERS: 1}
-    ):
         yield
 
 
@@ -586,3 +564,31 @@ def reset_sys_modules():
             del sys.modules[module]
 
     importlib.invalidate_caches()
+
+
+@pytest.fixture(autouse=True, scope="module")
+def leaves_no_extraneous_files():
+    """This fixture will fail a test if it seems to have left new files or directories
+    in the root of the local working tree.  For performance, it only checks for changes
+    at the test module level, but that should generally be enough to narrow down what
+    is happening.  If you're having trouble isolating the problematic test, you can
+    switch it to scope="function" temporarily.  It may also help to run the test suite
+    with one process (-n0) so that unrelated tests won't fail."""
+    before = set(Path(".").iterdir())
+    yield
+    after = set(Path(".").iterdir())
+    new_files = after - before
+
+    ignored_file_prefixes = {".coverage"}
+
+    new_files = {
+        f
+        for f in new_files
+        if not any(f.name.startswith(prefix) for prefix in ignored_file_prefixes)
+    }
+
+    if new_files:
+        raise AssertionError(
+            "One of the tests in this module left new files in the "
+            f"working directory: {new_files}"
+        )
